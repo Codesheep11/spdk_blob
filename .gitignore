@@ -1,0 +1,4 @@
+build
+spdk_blob.egg-info
+spdk_blob.cpython-311-x86_64-linux-gnu.so
+spdk_controller/__pycache__
