@@ -13,26 +13,25 @@ from tqdm import tqdm
 from threading import Lock 
 
 # --- 测试配置 ---
-BDEV_NAME = "Raid0"
-JSON_CONFIG_FILE = "/home/yangxc/project/KVCache/spdk_blob/json/Raid0.json"
+# BDEV_NAME = "Raid0"
+# JSON_CONFIG_FILE = "/home/yangxc/project/KVCache/spdk_blob/json/Raid0.json"
 
-# BDEV_NAME = "Nvme0n1"
-# JSON_CONFIG_FILE = "/home/yangxc/project/KVCache/spdk_blob/json/Nvme0n1.json"
+BDEV_NAME = "Nvme0n1"
+JSON_CONFIG_FILE = "/home/yangxc/project/KVCache/spdk_blob/json/Nvme0n1.json"
 REACTOR_MASK = "0xf000000000000"
+# REACTOR_MASK = "0xf"
 SOCK_PATH = "/var/tmp/spdk_test_api.sock"
 IO_SIZE_KB = 56 * 1024
 TOTAL_OPS_PER_THREAD = 1024
 NUM_TEST_THREADS = 2
-IO_BATCH_SIZE = 64 # 对于单个IO模式，这代表一次提交多少个独立的IO；对于批处理模式，这代表一个批次包含多少IO
+IO_BATCH_SIZE = 128 # 对于单个IO模式，这代表一次提交多少个独立的IO；对于批处理模式，这代表一个批次包含多少IO
 RPC_SCRIPT_PATH = "/home/yangxc/project/KVCache/spdk/scripts/rpc.py"
 
-# <--- 优化点: 定义测试模式，可以轻松切换或运行所有模式
-TEST_MODES = ["single", "batch"] # "single" for one-by-one async IO, "batch" for batch async IO
-
+# 定义测试模式，可以轻松切换或运行所有模式
+# TEST_MODES = ["single", "batch"] # "single" for one-by-one async IO, "batch" for batch async IO
+TEST_MODES = ["single"]
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s [%(levelname)s] - %(message)s')
 
-
-# --- RPC 调用辅助函数 (保持不变) ---
 def get_bdev_iostat(sock_path: str, bdev_name: str) -> Dict[str, Any] | None:
     """
     通过调用 rpc.py 脚本获取指定 bdev 的 I/O 统计信息。
@@ -54,7 +53,8 @@ def get_bdev_iostat(sock_path: str, bdev_name: str) -> Dict[str, Any] | None:
         data = json.loads(result.stdout)
         
         tick_rate = data.get("tick_rate", 0)
-        if tick_rate == 0:
+        ticks = data.get("ticks", 0)
+        if tick_rate == 0 or ticks == 0:
             logging.error("Could not get tick_rate from RPC output.")
             return None
 
@@ -63,7 +63,7 @@ def get_bdev_iostat(sock_path: str, bdev_name: str) -> Dict[str, Any] | None:
                 return {
                     "bytes_read": bdev_stats.get("bytes_read", 0),
                     "bytes_written": bdev_stats.get("bytes_written", 0),
-                    "ticks": data.get("ticks", 0),
+                    "ticks": ticks,
                     "tick_rate": tick_rate,
                 }
         
@@ -88,7 +88,6 @@ def run_io_workload(
     memview = None
     
     try:
-        # 1. 注册线程并分配资源
         spdk.get_page_size() # 确保线程已注册
         buffer_size = IO_SIZE_KB * 1024
         memview, buffer_ptr = spdk.alloc_io_buffer_view(buffer_size)
@@ -96,10 +95,7 @@ def run_io_workload(
 
         # --- 写测试阶段 ---
         barriers['write_start'].wait()
-        
-        # 提前获取所有需要的blob
         test_sequence: List[Tuple[int, int]] = []
-        # 根据总操作数和每个blob能执行的操作数（这里简化为1个批次）来决定需要多少blob
         num_blobs_needed = (TOTAL_OPS_PER_THREAD + IO_BATCH_SIZE - 1) // IO_BATCH_SIZE
         for i in range(num_blobs_needed):
             handle = spdk.get_blob(timeout=10)
@@ -121,20 +117,15 @@ def run_io_workload(
                 write_future.result(timeout=15)
             
             elif mode == "single":
-                # <--- 优化点: 单个IO API测试逻辑 ---
                 futures: List[Future] = []
                 for _ in range(ops_in_this_batch):
-                    # 提交单个写请求，不阻塞
                     future = spdk.write_async(handle, buffer_ptr, 0, buffer_size)
                     futures.append(future)
-                # 等待这一"批"独立的IO全部完成
                 wait(futures, timeout=15)
-                # 检查每个future的结果，确保没有异常抛出
                 for f in futures:
                     f.result()
             
             ops_written += ops_in_this_batch
-            # <--- 优化点: 更新进度 ---
             with progress_lock:
                 progress_counter['write'] += ops_in_this_batch
 
@@ -142,7 +133,6 @@ def run_io_workload(
         
         barriers['write_done'].wait()
 
-        # --- 读测试阶段 ---
         barriers['read_start'].wait()
         
         random.shuffle(test_sequence)
@@ -161,7 +151,6 @@ def run_io_workload(
                 read_future.result(timeout=15)
             
             elif mode == "single":
-                # <--- 优化点: 单个IO API测试逻辑 ---
                 futures: List[Future] = []
                 for _ in range(ops_in_this_batch):
                     future = spdk.read_async(handle, buffer_ptr, 0, buffer_size)
@@ -177,7 +166,6 @@ def run_io_workload(
                 break
             
             ops_read += ops_in_this_batch
-            # <--- 优化点: 更新进度 ---
             with progress_lock:
                 progress_counter['read'] += ops_in_this_batch
 
@@ -197,7 +185,6 @@ def run_io_workload(
             result_list.append((thread_name, total_write_time, total_read_time))
 
 
-# <--- 优化点: 将核心测试流程封装成一个函数 ---
 def run_test_phase(mode: str):
     """为指定的模式 (single/batch) 运行完整的测试流程"""
     logging.info("=" * 70)
@@ -321,10 +308,6 @@ def run_test_phase(mode: str):
 def main():
     if not os.path.exists(JSON_CONFIG_FILE):
         sys.exit(f"ERROR: SPDK config file not found: {JSON_CONFIG_FILE}")
-
-    # 注意: 您的测试文件中这里模块名写错了，我已修正。
-    # 应该是 spdk.init(...) 而不是 spdk_controller.init(...)
-    # 假设您的 __init__.py 文件名为 spdk_controller.py
     spdk.init(BDEV_NAME, JSON_CONFIG_FILE, REACTOR_MASK, SOCK_PATH)
     
     try:
