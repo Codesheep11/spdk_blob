@@ -108,6 +108,14 @@ extern "C"
         io_request_context_t *io_req_freelist;
     } worker_thread_t;
 
+    // 统一的 I/O 消息结构体，用于单次和批量提交
+    typedef struct spdk_io_msg
+    {
+        io_request_context_t **contexts; // 指向 I/O 请求上下文指针的数组
+        uint32_t count;                  // 数组中的请求数量 (单次IO时为1)
+        batch_io_context_t *batch_ctx;   // 指向批次共享上下文。对于单次IO，此指针为 NULL。
+    } spdk_io_msg_t;
+
     // --- 公开 API 函数声明 ---
 
     // --- 生命周期管理 ---
@@ -125,7 +133,6 @@ extern "C"
     int c_api_close_blob_async(spdk_blob_handle handle, PyObject *future);
 
     // --- 异步 I/O API ---
-    // 用于在桥接层安全地管理上下文对象生命周期
     io_request_context_t *c_api_alloc_io_request_ctx(int worker_id);
     void c_api_free_io_request_ctx(int worker_id, io_request_context_t *ctx);
 

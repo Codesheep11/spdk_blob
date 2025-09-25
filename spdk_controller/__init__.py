@@ -15,9 +15,9 @@ _spdk_initialized = False
 _BLOB_SIZE_IN_BYTES = 56 * (1024 ** 2)
 
 # Blob pool settings
-_INITIAL_BLOB_COUNT = 256
-_MAX_TOTAL_BLOB_COUNT = 1024
-_BLOB_REPOPULATE_BATCH_SIZE = 64
+_INITIAL_BLOB_COUNT = 4096
+_MAX_TOTAL_BLOB_COUNT = 8192
+_BLOB_REPOPULATE_BATCH_SIZE = 512
 
 # Watermark to trigger asynchronous repopulation
 _LOW_WATER_MARK = _INITIAL_BLOB_COUNT // 4
@@ -367,7 +367,6 @@ def free_io_buffer(ptr: int) -> None:
     spdk_blob.free_io_buffer(ptr)
 
 # --- Cached Metadata APIs ---
-# ... (The rest of the file is unchanged) ...
 def get_page_size() -> int: 
     """Get the page size of the underlying blobstore (cached)."""
     global _page_size_cache

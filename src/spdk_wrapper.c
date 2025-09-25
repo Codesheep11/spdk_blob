@@ -27,9 +27,8 @@
     } while (0)
 #endif
 
-#define ASYNC_CTX_POOL_SIZE 128
-#define IO_REQUEST_POOL_SIZE 1024
-#define TARGET_QUEUE_DEPTH 64
+#define ASYNC_CTX_POOL_SIZE 256
+#define IO_REQUEST_POOL_SIZE 2048
 #define MAX_PY_THREADS 128
 #define CACHE_LINE_SIZE 64
 
@@ -56,7 +55,6 @@ typedef struct
 } thread_map_entry_t;
 
 // --- 静态函数声明 ---
-
 static void _finish_async_op(PyObject *future, result_type_t rtype, uint64_t rval, int bserrno);
 static worker_thread_t *get_current_worker(void);
 
@@ -83,7 +81,6 @@ static pthread_mutex_t g_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 static sem_t g_workers_ready_sem;
 
 static spdk_worker_pool_t g_worker_pool;
-
 static thread_map_entry_t g_thread_map[MAX_PY_THREADS];
 static pthread_mutex_t g_thread_map_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_thread_map_size = 0;
@@ -110,7 +107,6 @@ static int init_io_request_pool(uint32_t num_workers);
 static void destroy_io_request_pool(void);
 static io_request_context_t *alloc_io_request_ctx(worker_thread_t *worker);
 static void free_io_request_ctx(io_request_context_t *req_ctx, worker_thread_t *worker);
-
 static void _sem_destroy_wrapper(sem_t *sem);
 
 // --- 回调函数 ---
@@ -119,18 +115,12 @@ static void _io_async_cb(void *cb_arg, int bserrno)
     io_request_context_t *req_ctx = cb_arg;
     worker_thread_t *worker = req_ctx->worker;
 
-    if (worker)
-        worker->inflight_io--;
-    else
-        SPDK_WARNLOG("Could not find worker for completed IO on lcore %u\n", spdk_env_get_current_core());
-
-    // 检查是否是批次操作的一部分
+    // 此处逻辑无需修改，它能优雅地处理单个和批量两种情况
     if (req_ctx->batch_ctx)
     {
         batch_io_context_t *batch = req_ctx->batch_ctx;
         if (bserrno != 0)
         {
-            // 原子地存储第一个遇到的错误码
             int expected_errno = 0;
             atomic_compare_exchange_strong(&batch->first_errno, &expected_errno, bserrno);
         }
@@ -144,7 +134,7 @@ static void _io_async_cb(void *cb_arg, int bserrno)
             free(batch);
         }
     }
-    else // 原有的单个I/O逻辑
+    else // 单个I/O (batch_ctx 为 NULL)
     {
         __sync_fetch_and_sub(&g_async_ops_in_flight, 1);
         _finish_async_op(req_ctx->future, RESULT_TYPE_NONE, 0, bserrno);
@@ -189,13 +179,12 @@ static worker_thread_t *get_current_worker(void)
     }
     return NULL;
 }
-
 static int worker_io_poller(void *arg)
 {
     worker_thread_t *worker = arg;
     io_request_context_t *req_ctx;
 
-    while (worker->inflight_io < TARGET_QUEUE_DEPTH && !TAILQ_EMPTY(&worker->pending_py_requests))
+    while (!TAILQ_EMPTY(&worker->pending_py_requests))
     {
         req_ctx = TAILQ_FIRST(&worker->pending_py_requests);
         TAILQ_REMOVE(&worker->pending_py_requests, req_ctx, link);
@@ -214,23 +203,39 @@ static int worker_io_poller(void *arg)
 }
 
 // --- 消息处理函数 ---
-
-static void _enqueue_msg_handler(void *arg)
+static void _unified_enqueue_io_handler(void *arg)
 {
-    io_request_context_t *req_ctx = arg;
+    spdk_io_msg_t *msg = arg;
     worker_thread_t *worker = get_current_worker();
+
     if (worker)
     {
-        TAILQ_INSERT_TAIL(&worker->pending_py_requests, req_ctx, link);
+        for (uint32_t i = 0; i < msg->count; i++)
+        {
+            io_request_context_t *req_ctx = msg->contexts[i];
+            req_ctx->batch_ctx = msg->batch_ctx;
+            TAILQ_INSERT_TAIL(&worker->pending_py_requests, req_ctx, link);
+        }
     }
     else
     {
         SPDK_ERRLOG("Cannot find worker on lcore %u to enqueue request\n", spdk_env_get_current_core());
-        _finish_async_op(req_ctx->future, RESULT_TYPE_NONE, 0, -EIO);
-        Py_DECREF(req_ctx->future);
+        if (msg->batch_ctx)
+        {
+            _finish_async_op(msg->batch_ctx->future, RESULT_TYPE_NONE, 0, -EIO);
+            Py_DECREF(msg->batch_ctx->future);
+            free(msg->batch_ctx);
+        }
+        else if (msg->count > 0)
+        {
+            _finish_async_op(msg->contexts[0]->future, RESULT_TYPE_NONE, 0, -EIO);
+            Py_DECREF(msg->contexts[0]->future);
+        }
     }
-}
 
+    free(msg->contexts);
+    free(msg);
+}
 static void _msg_create_blob(void *arg)
 {
     spdk_async_ctx *ctx = arg;
@@ -258,7 +263,6 @@ static void _msg_close_blob(void *arg)
     __sync_fetch_and_add(&g_async_ops_in_flight, 1);
     spdk_blob_close(ctx->data.handle, _generic_async_cb, ctx);
 }
-
 static void _msg_get_free_clusters(void *arg)
 {
     msg_ctx_get_size *ctx = arg;
@@ -278,8 +282,7 @@ static void _msg_free_buffer(void *arg)
     sem_post(&ctx->sem);
 }
 
-// --- SPDK 启动和关闭流程 ---
-
+// --- SPDK 启动和关闭流程 (此部分无改动) ---
 static void _worker_thread_init_msg(void *arg)
 {
     worker_thread_t *worker = arg;
@@ -374,7 +377,6 @@ static void _msg_shutdown(void *arg)
     g_shutdown_initiated = true;
     g_unload_poller = SPDK_POLLER_REGISTER(_unload_poller_cb, NULL, 10000);
 }
-
 static void _check_workers_ready(void *arg)
 {
     for (uint32_t i = 0; i < g_num_worker_threads; i++)
@@ -517,8 +519,7 @@ static void *spdk_thread_func(void *arg)
     return NULL;
 }
 
-// --- Python <-> C 交互 ---
-
+// --- Python <-> C 交互 (此部分无改动) ---
 static void _finish_async_op(PyObject *future, result_type_t rtype, uint64_t rval, int bserrno)
 {
     if (!future || !g_completion_loop)
@@ -580,7 +581,6 @@ static void _finish_async_op(PyObject *future, result_type_t rtype, uint64_t rva
 cleanup:
     PyGILState_Release(gstate);
 }
-
 static uint32_t count_set_bits(unsigned long long n)
 {
     uint32_t count = 0;
@@ -593,7 +593,6 @@ static uint32_t count_set_bits(unsigned long long n)
 }
 
 // --- 公开 API 实现 ---
-
 int c_api_init(const char *bdev_name, const char *json_config_file, const char *reactor_mask, const char *sock, PyObject *completion_loop)
 {
     if (g_spdk_thread_id != 0)
@@ -677,7 +676,6 @@ int c_api_init(const char *bdev_name, const char *json_config_file, const char *
     DEBUG_LOG("SPDK is ready.");
     return 0;
 }
-
 int c_api_unload(void)
 {
     if (g_spdk_thread_id == 0)
@@ -710,16 +708,13 @@ int c_api_unload(void)
     g_worker_threads = NULL;
     return g_spdk_thread_rc;
 }
-
 int c_api_register_io_thread(void)
 {
     if (tls_worker_id != -1)
     {
         return tls_worker_id;
     }
-
     pthread_t self_tid = pthread_self();
-
     pthread_mutex_lock(&g_thread_map_lock);
     for (int i = 0; i < g_thread_map_size; i++)
     {
@@ -738,7 +733,6 @@ int c_api_register_io_thread(void)
         }
     }
     pthread_mutex_unlock(&g_thread_map_lock);
-
     pthread_mutex_lock(&g_worker_pool.lock);
     int worker_idx = -1;
     for (uint32_t i = 0; i < g_num_worker_threads; i++)
@@ -751,13 +745,11 @@ int c_api_register_io_thread(void)
         }
     }
     pthread_mutex_unlock(&g_worker_pool.lock);
-
     if (worker_idx == -1)
     {
         SPDK_ERRLOG("No available SPDK worker threads.\n");
         return -1;
     }
-
     pthread_mutex_lock(&g_thread_map_lock);
     if (g_thread_map_size >= MAX_PY_THREADS)
     {
@@ -771,18 +763,14 @@ int c_api_register_io_thread(void)
     g_thread_map[map_idx].py_tid = self_tid;
     g_thread_map[map_idx].spdk_worker = &g_worker_threads[worker_idx];
     pthread_mutex_unlock(&g_thread_map_lock);
-
     DEBUG_LOG("Python thread %p registered to SPDK worker on lcore %u", (void *)self_tid, g_worker_threads[worker_idx].lcore);
-
     tls_worker_id = worker_idx;
     return worker_idx;
 }
-
 void c_api_unregister_io_thread(void)
 {
     pthread_t self_tid = pthread_self();
     worker_thread_t *worker = NULL;
-
     pthread_mutex_lock(&g_thread_map_lock);
     for (int i = 0; i < g_thread_map_size; i++)
     {
@@ -794,7 +782,6 @@ void c_api_unregister_io_thread(void)
         }
     }
     pthread_mutex_unlock(&g_thread_map_lock);
-
     if (worker)
     {
         for (uint32_t i = 0; i < g_num_worker_threads; i++)
@@ -809,28 +796,20 @@ void c_api_unregister_io_thread(void)
             }
         }
     }
-
     tls_worker_id = -1;
 }
-
 io_request_context_t *c_api_alloc_io_request_ctx(int worker_id)
 {
     if (worker_id < 0 || (uint32_t)worker_id >= g_num_worker_threads)
-    {
         return NULL;
-    }
     return alloc_io_request_ctx(&g_worker_threads[worker_id]);
 }
-
 void c_api_free_io_request_ctx(int worker_id, io_request_context_t *ctx)
 {
     if (worker_id < 0 || (uint32_t)worker_id >= g_num_worker_threads || !ctx)
-    {
         return;
-    }
     free_io_request_ctx(ctx, &g_worker_threads[worker_id]);
 }
-
 int c_api_submit_batch_io_async(int worker_id, io_request_context_t **contexts, uint32_t count, PyObject *future)
 {
     if (!g_spdk_ready || count == 0)
@@ -844,49 +823,71 @@ int c_api_submit_batch_io_async(int worker_id, io_request_context_t **contexts, 
     batch_io_context_t *batch = malloc(sizeof(batch_io_context_t));
     if (!batch)
         return -ENOMEM;
-
     batch->future = future;
     Py_INCREF(batch->future);
     atomic_init(&batch->ref_count, count);
     atomic_init(&batch->first_errno, 0);
 
-    __sync_fetch_and_add(&g_async_ops_in_flight, 1);
-
-    for (uint32_t i = 0; i < count; i++)
+    spdk_io_msg_t *msg = malloc(sizeof(spdk_io_msg_t));
+    if (!msg)
     {
-        io_request_context_t *req_ctx = contexts[i];
-        req_ctx->future = NULL;
-        req_ctx->worker = worker;
-        req_ctx->batch_ctx = batch;
-        spdk_thread_send_msg(target_thread, _enqueue_msg_handler, req_ctx);
+        free(batch);
+        return -ENOMEM;
     }
+
+    msg->contexts = malloc(count * sizeof(io_request_context_t *));
+    if (!msg->contexts)
+    {
+        free(batch);
+        free(msg);
+        return -ENOMEM;
+    }
+    memcpy(msg->contexts, contexts, count * sizeof(io_request_context_t *));
+    msg->count = count;
+    msg->batch_ctx = batch;
+
+    __sync_fetch_and_add(&g_async_ops_in_flight, 1);
+    spdk_thread_send_msg(target_thread, _unified_enqueue_io_handler, msg);
+
     return 0;
 }
-
 int c_api_submit_single_io_async(int worker_id, io_request_context_t *ctx, PyObject *future)
 {
     if (!g_spdk_ready || !ctx)
         return -1;
-
-    // 检查 worker_id 的有效性
     if (worker_id < 0 || (uint32_t)worker_id >= g_num_worker_threads)
-    {
         return -EINVAL;
-    }
+
     worker_thread_t *worker = &g_worker_threads[worker_id];
+    struct spdk_thread *target_thread = worker->thread;
+
     ctx->worker = worker;
-
-    struct spdk_thread *target_thread = ctx->worker->thread;
-
     ctx->future = future;
-    ctx->batch_ctx = NULL;
     Py_INCREF(ctx->future);
+    ctx->batch_ctx = NULL;
+
+    spdk_io_msg_t *msg = malloc(sizeof(spdk_io_msg_t));
+    if (!msg)
+    {
+        Py_DECREF(ctx->future);
+        return -ENOMEM;
+    }
+
+    msg->contexts = malloc(1 * sizeof(io_request_context_t *));
+    if (!msg->contexts)
+    {
+        Py_DECREF(ctx->future);
+        free(msg);
+        return -ENOMEM;
+    }
+    msg->contexts[0] = ctx;
+    msg->count = 1;
+    msg->batch_ctx = NULL;
 
     __sync_fetch_and_add(&g_async_ops_in_flight, 1);
-    spdk_thread_send_msg(target_thread, _enqueue_msg_handler, ctx);
+    spdk_thread_send_msg(target_thread, _unified_enqueue_io_handler, msg);
     return 0;
 }
-
 int c_api_create_async(int num_clusters, PyObject *future)
 {
     if (!g_spdk_ready)
@@ -939,7 +940,6 @@ int c_api_close_blob_async(spdk_blob_handle handle, PyObject *future)
     spdk_thread_send_msg(g_main_spdk_thread, _msg_close_blob, ctx);
     return 0;
 }
-
 #define EXEC_SYNC_MSG(ctx_type, handler_func, cleanup_func, ...)      \
     do                                                                \
     {                                                                 \
@@ -951,17 +951,8 @@ int c_api_close_blob_async(spdk_blob_handle handle, PyObject *future)
         cleanup_func(&ctx.sem);                                       \
     } while (0)
 void _sem_destroy_wrapper(sem_t *sem) { sem_destroy(sem); }
-
-uint64_t c_api_get_page_size(void)
-{
-    return g_cached_page_size;
-}
-
-uint64_t c_api_get_cluster_size(void)
-{
-    return g_cached_cluster_size;
-}
-
+uint64_t c_api_get_page_size(void) { return g_cached_page_size; }
+uint64_t c_api_get_cluster_size(void) { return g_cached_cluster_size; }
 uint64_t c_api_get_free_clusters(void)
 {
     if (!g_spdk_ready)
@@ -970,12 +961,7 @@ uint64_t c_api_get_free_clusters(void)
     EXEC_SYNC_MSG(msg_ctx_get_size, _msg_get_free_clusters, _sem_destroy_wrapper, ctx.size_out = &s);
     return s;
 }
-
-uint64_t c_api_get_io_unit_size(void)
-{
-    return g_cached_io_unit_size;
-}
-
+uint64_t c_api_get_io_unit_size(void) { return g_cached_io_unit_size; }
 void *c_api_alloc_io_buffer(size_t size_bytes)
 {
     if (!g_spdk_ready)
@@ -991,7 +977,7 @@ void c_api_free_io_buffer(void *b)
     EXEC_SYNC_MSG(msg_ctx_buffer_op, _msg_free_buffer, _sem_destroy_wrapper, ctx.free.buffer = b);
 }
 
-// --- 对象池实现 ---
+// --- 对象池实现 (此部分无改动) ---
 static int init_io_request_pool(uint32_t num_workers)
 {
     if (num_workers == 0)
@@ -1004,14 +990,12 @@ static int init_io_request_pool(uint32_t num_workers)
     memset(g_io_request_pool.pool_buffer, 0, pool_size);
     return 0;
 }
-
 static void destroy_io_request_pool(void)
 {
     if (g_io_request_pool.pool_buffer)
         free(g_io_request_pool.pool_buffer);
     g_io_request_pool.pool_buffer = NULL;
 }
-
 static io_request_context_t *alloc_io_request_ctx(worker_thread_t *worker)
 {
     io_request_context_t *req_ctx = worker->io_req_freelist;
@@ -1021,7 +1005,6 @@ static io_request_context_t *alloc_io_request_ctx(worker_thread_t *worker)
     }
     return req_ctx;
 }
-
 static void free_io_request_ctx(io_request_context_t *req_ctx, worker_thread_t *worker)
 {
     if (!req_ctx)
@@ -1029,7 +1012,6 @@ static void free_io_request_ctx(io_request_context_t *req_ctx, worker_thread_t *
     req_ctx->link.tqe_next = (struct io_request_context *)worker->io_req_freelist;
     worker->io_req_freelist = req_ctx;
 }
-
 static int init_async_ctx_pool(void)
 {
     pthread_mutex_init(&g_async_ctx_pool.lock, NULL);

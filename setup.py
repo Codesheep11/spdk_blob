@@ -18,6 +18,15 @@ common_cflags = [
     "-fstack-protector", "-fno-common", "-march=native", "-mno-avx512f",
     "-O2", "-g", "-std=gnu11", "-D_GNU_SOURCE", "-DNDEBUG",
 ]
+optimization_flags = [
+    "-O3",
+    "-march=native", 
+    "-flto", 
+    "-fno-semantic-interposition",
+    "-ffast-math",
+]
+
+common_cflags = optimization_flags + common_cflags
 
 common_ldflags = [
     "-fuse-ld=bfd", "-Wl,-z,relro,-z,now", "-Wl,-z,noexecstack",
