@@ -2,6 +2,14 @@
 #include <Python.h>
 #include "spdk_wrapper.h"
 
+typedef struct
+{
+    spdk_blob_handle handle;
+    void *payload;
+    uint64_t offset_units;
+    uint64_t num_units;
+} c_py_io_request;
+
 static PyObject *retcode_to_py(int rc)
 {
     if (rc == 0)
@@ -139,145 +147,90 @@ static PyObject *py_c_api_read_async(PyObject *self, PyObject *args)
 
     Py_RETURN_NONE;
 }
+static PyObject *py_c_api_submit_batch_async_internal(PyObject *args, bool is_read)
+{
+    int worker_id;
+    unsigned long long requests_ptr_val; // 用于接收指针地址
+    int count;
+    PyObject *future;
 
+    // K (unsigned long long) 用于安全地接收来自ctypes的64位地址
+    if (!PyArg_ParseTuple(args, "iKiO", &worker_id, &requests_ptr_val, &count, &future))
+    {
+        PyErr_SetString(PyExc_TypeError, "Invalid arguments for batch operation. Expected (worker_id, ptr, count, future).");
+        return NULL;
+    }
+
+    if (count == 0)
+    {
+        // 如果批次为空，直接返回，Python层会处理future
+        Py_RETURN_NONE;
+    }
+
+    // 将传入的内存地址转为 C 结构体数组指针
+    c_py_io_request *py_requests = (c_py_io_request *)requests_ptr_val;
+
+    // 从 worker 的对象池中分配 io_request_context_t 指针数组
+    io_request_context_t **c_contexts = malloc(count * sizeof(io_request_context_t *));
+    if (!c_contexts)
+    {
+        return PyErr_NoMemory();
+    }
+
+    Py_ssize_t allocated_count = 0;
+    bool error_occurred = false;
+
+    // 4. 不再有 Python API 调用，直接在 C 层面高效循环
+    for (int i = 0; i < count; i++)
+    {
+        io_request_context_t *ctx = c_api_alloc_io_request_ctx(worker_id);
+        if (!ctx)
+        {
+            PyErr_SetString(PyExc_MemoryError, "Failed to allocate io_request_context from pool");
+            error_occurred = true;
+            break;
+        }
+        c_contexts[allocated_count++] = ctx;
+
+        // 直接从 C 结构体中拷贝数据，没有 PyObject 解析！
+        ctx->handle = py_requests[i].handle;
+        ctx->payload = py_requests[i].payload;
+        ctx->offset_io_units = py_requests[i].offset_units;
+        ctx->num_io_units = py_requests[i].num_units;
+        ctx->is_read = is_read;
+    }
+
+    if (error_occurred)
+    {
+        for (Py_ssize_t i = 0; i < allocated_count; i++)
+        {
+            c_api_free_io_request_ctx(worker_id, c_contexts[i]);
+        }
+        free(c_contexts);
+        return NULL;
+    }
+
+    // 调用核心 C API 提交批量请求
+    c_api_submit_batch_io_async(worker_id, c_contexts, (uint32_t)count, future);
+
+    // c_contexts 数组本身可以被释放，因为它的内容已经被消息系统拷贝或消费。
+    free(c_contexts);
+    Py_RETURN_NONE;
+}
+
+// py_c_api_write_batch_async 现在只是一个简单的包装
 static PyObject *py_c_api_write_batch_async(PyObject *self, PyObject *args)
 {
-    int worker_id;
-    PyObject *requests_list, *future;
-    if (!PyArg_ParseTuple(args, "iO!O:write_batch_async", &worker_id, &PyList_Type, &requests_list, &future))
-        return NULL;
-
-    Py_ssize_t count = PyList_GET_SIZE(requests_list);
-    if (count == 0)
-        Py_RETURN_NONE;
-
-    io_request_context_t **c_contexts = malloc(count * sizeof(io_request_context_t *));
-    if (!c_contexts)
-        return PyErr_NoMemory();
-
-    Py_ssize_t allocated_count = 0;
-    bool error_occurred = false;
-
-    for (Py_ssize_t i = 0; i < count; i++)
-    {
-        PyObject *item = PyList_GET_ITEM(requests_list, i);
-        PyObject *handle_obj, *payload_obj;
-        unsigned long long offset, num;
-
-        if (!PyArg_ParseTuple(item, "OOKK", &handle_obj, &payload_obj, &offset, &num))
-        {
-            PyErr_SetString(PyExc_TypeError, "Each request in the batch must be a tuple of (handle, payload_ptr, offset_units, num_units)");
-            error_occurred = true;
-            break;
-        }
-
-        io_request_context_t *ctx = c_api_alloc_io_request_ctx(worker_id);
-        if (!ctx)
-        {
-            PyErr_SetString(PyExc_MemoryError, "Failed to allocate io_request_context from pool");
-            error_occurred = true;
-            break;
-        }
-        c_contexts[allocated_count++] = ctx;
-
-        ctx->handle = (spdk_blob_handle)PyLong_AsVoidPtr(handle_obj);
-        ctx->payload = PyLong_AsVoidPtr(payload_obj);
-        ctx->offset_io_units = offset;
-        ctx->num_io_units = num;
-        ctx->is_read = false;
-
-        if (PyErr_Occurred())
-        {
-            error_occurred = true;
-            break;
-        }
-    }
-
-    if (error_occurred)
-    {
-        for (Py_ssize_t i = 0; i < allocated_count; i++)
-        {
-            c_api_free_io_request_ctx(worker_id, c_contexts[i]);
-        }
-        free(c_contexts);
-        return NULL;
-    }
-
-    c_api_submit_batch_io_async(worker_id, c_contexts, (uint32_t)count, future);
-
-    free(c_contexts);
-    Py_RETURN_NONE;
+    return py_c_api_submit_batch_async_internal(args, false); // is_read = false
 }
 
+// py_c_api_read_batch_async 也是一个简单的包装
 static PyObject *py_c_api_read_batch_async(PyObject *self, PyObject *args)
 {
-    int worker_id;
-    PyObject *requests_list, *future;
-    if (!PyArg_ParseTuple(args, "iO!O:read_batch_async", &worker_id, &PyList_Type, &requests_list, &future))
-        return NULL;
-
-    Py_ssize_t count = PyList_GET_SIZE(requests_list);
-    if (count == 0)
-        Py_RETURN_NONE;
-
-    io_request_context_t **c_contexts = malloc(count * sizeof(io_request_context_t *));
-    if (!c_contexts)
-        return PyErr_NoMemory();
-
-    Py_ssize_t allocated_count = 0;
-    bool error_occurred = false;
-
-    for (Py_ssize_t i = 0; i < count; i++)
-    {
-        PyObject *item = PyList_GET_ITEM(requests_list, i);
-        PyObject *handle_obj, *payload_obj;
-        unsigned long long offset, num;
-
-        if (!PyArg_ParseTuple(item, "OOKK", &handle_obj, &payload_obj, &offset, &num))
-        {
-            PyErr_SetString(PyExc_TypeError, "Each request in the batch must be a tuple of (handle, payload_ptr, offset_units, num_units)");
-            error_occurred = true;
-            break;
-        }
-
-        io_request_context_t *ctx = c_api_alloc_io_request_ctx(worker_id);
-        if (!ctx)
-        {
-            PyErr_SetString(PyExc_MemoryError, "Failed to allocate io_request_context from pool");
-            error_occurred = true;
-            break;
-        }
-        c_contexts[allocated_count++] = ctx;
-
-        ctx->handle = (spdk_blob_handle)PyLong_AsVoidPtr(handle_obj);
-        ctx->payload = PyLong_AsVoidPtr(payload_obj);
-        ctx->offset_io_units = offset;
-        ctx->num_io_units = num;
-        ctx->is_read = true; // For read batch
-
-        if (PyErr_Occurred())
-        {
-            error_occurred = true;
-            break;
-        }
-    }
-
-    if (error_occurred)
-    {
-        for (Py_ssize_t i = 0; i < allocated_count; i++)
-        {
-            c_api_free_io_request_ctx(worker_id, c_contexts[i]);
-        }
-        free(c_contexts);
-        return NULL;
-    }
-
-    c_api_submit_batch_io_async(worker_id, c_contexts, (uint32_t)count, future);
-
-    free(c_contexts);
-    Py_RETURN_NONE;
+    return py_c_api_submit_batch_async_internal(args, true); // is_read = true
 }
 
+// --- 辅助函数 ---
 static PyObject *py_c_api_get_page_size(PyObject *self, PyObject *Py_UNUSED(ignored)) { return PyLong_FromUnsignedLongLong(c_api_get_page_size()); }
 static PyObject *py_c_api_get_cluster_size(PyObject *self, PyObject *Py_UNUSED(ignored)) { return PyLong_FromUnsignedLongLong(c_api_get_cluster_size()); }
 static PyObject *py_c_api_get_free_cluster_count(PyObject *self, PyObject *Py_UNUSED(ignored)) { return PyLong_FromUnsignedLongLong(c_api_get_free_clusters()); }
@@ -333,6 +286,7 @@ static PyObject *py_c_api_free_io_buffer(PyObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+// --- 模块定义 ---
 PyMODINIT_FUNC PyInit_spdk_blob(void);
 
 static PyMethodDef SpdkMethods[] = {
@@ -346,8 +300,8 @@ static PyMethodDef SpdkMethods[] = {
     {"close_async", py_c_api_close_async, METH_VARARGS, "Asynchronously close a blob."},
     {"write_async", py_c_api_write_async, METH_VARARGS, "Asynchronously write to a blob on a specific worker."},
     {"read_async", py_c_api_read_async, METH_VARARGS, "Asynchronously read from a blob on a specific worker."},
-    {"write_batch_async", py_c_api_write_batch_async, METH_VARARGS, "Asynchronously write a batch of requests to blobs."},
-    {"read_batch_async", py_c_api_read_batch_async, METH_VARARGS, "Asynchronously read a batch of requests from blobs."},
+    {"write_batch_async", py_c_api_write_batch_async, METH_VARARGS, "Asynchronously write a batch of requests using a ctypes buffer pointer."},
+    {"read_batch_async", py_c_api_read_batch_async, METH_VARARGS, "Asynchronously read a batch of requests using a ctypes buffer pointer."},
     {"get_page_size", py_c_api_get_page_size, METH_NOARGS, "Get page size."},
     {"get_cluster_size", py_c_api_get_cluster_size, METH_NOARGS, "Get cluster size."},
     {"get_free_cluster_count", py_c_api_get_free_cluster_count, METH_NOARGS, "Get free cluster count."},

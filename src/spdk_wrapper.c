@@ -28,7 +28,7 @@
 #endif
 
 #define ASYNC_CTX_POOL_SIZE 256
-#define IO_REQUEST_POOL_SIZE 2048
+#define IO_REQUEST_POOL_SIZE 4096
 #define MAX_PY_THREADS 128
 #define CACHE_LINE_SIZE 64
 
@@ -819,7 +819,10 @@ int c_api_submit_batch_io_async(int worker_id, io_request_context_t **contexts, 
 
     worker_thread_t *worker = &g_worker_threads[worker_id];
     struct spdk_thread *target_thread = worker->thread;
-
+    for (uint32_t i = 0; i < count; i++)
+    {
+        contexts[i]->worker = worker;
+    }
     batch_io_context_t *batch = malloc(sizeof(batch_io_context_t));
     if (!batch)
         return -ENOMEM;

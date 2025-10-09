@@ -4,6 +4,7 @@ import math
 import logging
 import threading
 import time
+import ctypes # <--- 1. 引入 ctypes
 from typing import Dict, Tuple, Any, List
 from concurrent.futures import Future
 from queue import Queue, Empty
@@ -13,43 +14,36 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s [%(
 # --- Module Globals ---
 _spdk_initialized = False
 _BLOB_SIZE_IN_BYTES = 56 * (1024 ** 2)
-
-# Blob pool settings
 _INITIAL_BLOB_COUNT = 4096
 _MAX_TOTAL_BLOB_COUNT = 8192
 _BLOB_REPOPULATE_BATCH_SIZE = 512
-
-# Watermark to trigger asynchronous repopulation
 _LOW_WATER_MARK = _INITIAL_BLOB_COUNT // 4
-
 _completion_loop: asyncio.AbstractEventLoop = None
 _completion_thread: threading.Thread = None
 _free_blobs_queue: Queue[int] = Queue()
-
-# <--- 优化点: 引入 threading.local() 用于线程局部存储
 _thread_local_storage = threading.local()
-
-# _thread_map 仍然需要，用于确保每个线程只向C层注册一次
 _thread_map: Dict[int, int] = {} 
 _thread_map_lock = threading.Lock()
-
 _all_blob_ids: List[int] = []
 _all_blob_handles: List[int] = []
-
-# Globals for dynamic blob creation
 _blob_size_in_clusters = 0
 _is_repopulating = False
 _repopulation_state_lock = threading.Lock()
-
-# Globals for Python-level metadata caching
 _page_size_cache: int = -1
 _cluster_size_cache: int = -1
 _io_unit_size_cache: int = -1
 _metadata_cache_lock = threading.Lock()
 
+class _C_IO_Request(ctypes.Structure):
+    _fields_ = [
+        ("handle", ctypes.c_void_p),      # 对应 spdk_blob_handle (void*)
+        ("payload", ctypes.c_void_p),     # 对应 void*
+        ("offset_units", ctypes.c_uint64), # 对应 uint64_t
+        ("num_units", ctypes.c_uint64),    # 对应 uint64_t
+    ]
+
 
 # --- Internal Implementation ---
-
 def _completion_loop_runner():
     """Background thread running an asyncio event loop for C callbacks."""
     global _completion_loop
@@ -64,24 +58,19 @@ def _submit_meta_op_blocking(spdk_func, *args) -> Any:
     """Helper to call an async metadata op and block for its result."""
     if not _completion_loop or not _completion_loop.is_running():
         raise RuntimeError("SPDK completion loop is not running.")
-    
     future = Future()
-    
     def on_done(async_future):
         try:
             future.set_result(async_future.result())
         except Exception as e:
             future.set_exception(e)
-            
     def do_submit():
         loop_future = _completion_loop.create_future()
         loop_future.add_done_callback(on_done)
         spdk_func(*args, loop_future)
-
     _completion_loop.call_soon_threadsafe(do_submit)
     return future.result(timeout=20)
 
-# <--- 优化点: 完全重写 _get_or_register_worker_id 函数
 def _get_or_register_worker_id() -> int:
     """
     Implicitly registers the current thread with SPDK if not already done.
@@ -114,7 +103,6 @@ async def _submit_meta_op_async(spdk_func, *args) -> Any:
     """Helper to call an async metadata op and await its result in an async context."""
     if not _completion_loop or not _completion_loop.is_running():
         raise RuntimeError("SPDK completion loop is not running.")
-    
     loop_future = _completion_loop.create_future()
     _completion_loop.call_soon_threadsafe(spdk_func, *args, loop_future)
     return await loop_future
@@ -133,26 +121,18 @@ async def _repopulate_blobs_task():
                 logging.warning(f"Max blob count ({_MAX_TOTAL_BLOB_COUNT}) reached. Cannot repopulate.")
                 return
             num_to_create = min(_BLOB_REPOPULATE_BATCH_SIZE, _MAX_TOTAL_BLOB_COUNT - current_count)
-        
-        if num_to_create <= 0:
-            return
-
+        if num_to_create <= 0: return
         logging.info(f"Repopulating with a new batch of {num_to_create} blobs...")
-        
         create_tasks = [_submit_meta_op_async(spdk_blob.create_async, _blob_size_in_clusters) for _ in range(num_to_create)]
         new_ids = await asyncio.gather(*create_tasks)
-
         open_tasks = [_submit_meta_op_async(spdk_blob.open_async, bid) for bid in new_ids]
         new_handles = await asyncio.gather(*open_tasks)
-
         with _repopulation_state_lock:
              _all_blob_ids.extend(new_ids)
              _all_blob_handles.extend(new_handles)
              for handle in new_handles:
                  _free_blobs_queue.put(handle)
-        
         logging.info(f"Blob pool repopulated. Total blobs now: {len(_all_blob_handles)}")
-
     except Exception as e:
         logging.error(f"Failed to repopulate blob pool asynchronously: {e}", exc_info=True)
     finally:
@@ -167,42 +147,30 @@ def _trigger_repopulation():
     """
     global _is_repopulating
     with _repopulation_state_lock:
-        if _is_repopulating:
-            return
-
+        if _is_repopulating: return
         current_count = len(_all_blob_handles)
-        if current_count >= _MAX_TOTAL_BLOB_COUNT:
-            return
-            
+        if current_count >= _MAX_TOTAL_BLOB_COUNT: return
         _is_repopulating = True
-
     logging.info("Low water mark hit. Asynchronous blob repopulation triggered.")
-    _completion_loop.call_soon_threadsafe(
-        lambda: _completion_loop.create_task(_repopulate_blobs_task())
-    )
+    _completion_loop.call_soon_threadsafe(lambda: _completion_loop.create_task(_repopulate_blobs_task()))
+
 
 # --- Public API ---
-
 def init(bdev_name: str, json_config_path: str, reactor_mask: str, sock: str) -> None:
     """Initializes the SPDK environment and resources."""
     global _spdk_initialized, _completion_thread, _all_blob_ids, _all_blob_handles, _blob_size_in_clusters
-    if _spdk_initialized:
-        return
-
+    if _spdk_initialized: return
     _completion_thread = threading.Thread(target=_completion_loop_runner, name="SPDK-Completion-Thread", daemon=True)
     _completion_thread.start()
     while not _completion_loop or not _completion_loop.is_running():
         time.sleep(0.01)
-
     spdk_blob.init(bdev_name, json_config_path, reactor_mask, sock, _completion_loop)
     _spdk_initialized = True
-    
     page_size = get_page_size()
     cluster_size = get_cluster_size()
     io_unit = get_io_unit_size()
     free_cluster_count = spdk_blob.get_free_cluster_count()
     _blob_size_in_clusters = math.ceil(_BLOB_SIZE_IN_BYTES / cluster_size)
-
     logging.info(f"Populating global blob pool with {_INITIAL_BLOB_COUNT} blobs...")
     try:
         _all_blob_ids = [_submit_meta_op_blocking(spdk_blob.create_async, _blob_size_in_clusters) for _ in range(_INITIAL_BLOB_COUNT)]
@@ -215,38 +183,30 @@ def init(bdev_name: str, json_config_path: str, reactor_mask: str, sock: str) ->
         logging.error("Failed to populate global blob pool during init. Unloading...", exc_info=True)
         unload()
         raise e
-
     logging.info("SPDK global init successful.")
 
 def unload() -> None:
     """Gracefully shuts down all resources and unloads SPDK."""
     global _spdk_initialized, _completion_loop, _completion_thread
     if not _spdk_initialized: return
-    
     logging.info("Cleaning up global blob pool...")
     try:
         for handle in _all_blob_handles:
              _submit_meta_op_blocking(spdk_blob.close_async, handle)
         logging.info(f"Closed all {len(_all_blob_handles)} blob handles.")
-        
         for bid in _all_blob_ids:
             _submit_meta_op_blocking(spdk_blob.delete_async, bid)
         logging.info(f"Deleted all {len(_all_blob_ids)} blobs.")
-
     except Exception as e:
         logging.warning(f"An error occurred during blob cleanup, unload might fail: {e}", exc_info=True)
-
     _all_blob_handles.clear()
     _all_blob_ids.clear()
-    
     spdk_blob.unload()
     _spdk_initialized = False
-
     if _completion_loop and _completion_loop.is_running():
         _completion_loop.call_soon_threadsafe(_completion_loop.stop)
     if _completion_thread:
         _completion_thread.join()
-    
     _completion_loop = None
     _completion_thread = None
     _thread_map.clear()
@@ -263,7 +223,7 @@ def cleanup_current_thread():
             try:
                 del _thread_local_storage.worker_id
             except AttributeError:
-                pass # No existía, no hay problema
+                pass
             logging.info(f"Cleaned up registration for thread {thread_id}.")
 
 def get_blob(timeout: float = 5.0) -> int:
@@ -274,10 +234,8 @@ def get_blob(timeout: float = 5.0) -> int:
     """
     try:
         handle = _free_blobs_queue.get(timeout=timeout)
-        
         if _free_blobs_queue.qsize() < _LOW_WATER_MARK:
             _trigger_repopulation()
-            
         return handle
     except Empty:
         raise RuntimeError(f"Failed to get a free blob handle within {timeout}s. Pool is empty and asynchronous repopulation might be too slow or has failed.")
@@ -289,12 +247,10 @@ def release_blob(handle: int):
 def write_async(handle: int, ptr: int, offset_bytes: int, size_bytes: int) -> Future:
     """Asynchronously write data to a blob."""
     if not _spdk_initialized: raise RuntimeError("SPDK is not initialized.")
-    
     worker_id = _get_or_register_worker_id()
     io_unit_size = get_io_unit_size()
     offset_units = offset_bytes // io_unit_size
     num_units = size_bytes // io_unit_size
-    
     future = Future()
     spdk_blob.write_async(worker_id, handle, ptr, offset_units, num_units, future)
     return future
@@ -302,19 +258,17 @@ def write_async(handle: int, ptr: int, offset_bytes: int, size_bytes: int) -> Fu
 def read_async(handle: int, ptr: int, offset_bytes: int, size_bytes: int) -> Future:
     """Asynchronously read data from a blob."""
     if not _spdk_initialized: raise RuntimeError("SPDK is not initialized.")
-
     worker_id = _get_or_register_worker_id()
     io_unit_size = get_io_unit_size()
     offset_units = offset_bytes // io_unit_size
     num_units = size_bytes // io_unit_size
-    
     future = Future()
     spdk_blob.read_async(worker_id, handle, ptr, offset_units, num_units, future)
     return future
 
 def write_batch_async(requests: List[Tuple[int, int, int, int]]) -> Future:
     """
-    Asynchronously write a batch of data to blobs.
+    Asynchronously write a batch of data to blobs using a zero-copy ctypes buffer.
     """
     if not _spdk_initialized: raise RuntimeError("SPDK is not initialized.")
     if not requests:
@@ -324,19 +278,30 @@ def write_batch_async(requests: List[Tuple[int, int, int, int]]) -> Future:
     
     worker_id = _get_or_register_worker_id()
     io_unit_size = get_io_unit_size()
+    batch_size = len(requests)
     
-    c_requests = [
-        (handle, ptr, offset // io_unit_size, size // io_unit_size)
-        for handle, ptr, offset, size in requests
-    ]
+    # 在 Python 端创建 C 内存布局的数组
+    c_requests_array = (_C_IO_Request * batch_size)()
+
+    # 高效地填充这块内存
+    for i, (handle, ptr, offset, size) in enumerate(requests):
+        req = c_requests_array[i]
+        req.handle = handle
+        req.payload = ptr
+        req.offset_units = offset // io_unit_size
+        req.num_units = size // io_unit_size
+    
+    # 获取指向这块内存的指针
+    array_ptr = ctypes.addressof(c_requests_array)
     
     future = Future()
-    spdk_blob.write_batch_async(worker_id, c_requests, future)
+    # 调用新的 C API，只传递指针和长度
+    spdk_blob.write_batch_async(worker_id, array_ptr, batch_size, future)
     return future
 
 def read_batch_async(requests: List[Tuple[int, int, int, int]]) -> Future:
     """
-    Asynchronously read a batch of data from blobs.
+    Asynchronously read a batch of data from blobs using a zero-copy ctypes buffer.
     """
     if not _spdk_initialized: raise RuntimeError("SPDK is not initialized.")
     if not requests:
@@ -346,14 +311,21 @@ def read_batch_async(requests: List[Tuple[int, int, int, int]]) -> Future:
 
     worker_id = _get_or_register_worker_id()
     io_unit_size = get_io_unit_size()
-    
-    c_requests = [
-        (handle, ptr, offset // io_unit_size, size // io_unit_size)
-        for handle, ptr, offset, size in requests
-    ]
+    batch_size = len(requests)
+
+    c_requests_array = (_C_IO_Request * batch_size)()
+
+    for i, (handle, ptr, offset, size) in enumerate(requests):
+        req = c_requests_array[i]
+        req.handle = handle
+        req.payload = ptr
+        req.offset_units = offset // io_unit_size
+        req.num_units = size // io_unit_size
+
+    array_ptr = ctypes.addressof(c_requests_array)
     
     future = Future()
-    spdk_blob.read_batch_async(worker_id, c_requests, future)
+    spdk_blob.read_batch_async(worker_id, array_ptr, batch_size, future)
     return future
 
 def alloc_io_buffer_view(size: int) -> Tuple[memoryview, int]:
