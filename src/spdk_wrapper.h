@@ -123,8 +123,7 @@ extern "C"
     int c_api_unload(void);
 
     // --- 线程管理 API ---
-    int c_api_register_io_thread(void);
-    void c_api_unregister_io_thread(void);
+    uint32_t c_api_get_worker_count(void);
 
     // --- 异步元数据 API ---
     int c_api_create_async(int num_clusters, PyObject *future);

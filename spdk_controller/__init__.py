@@ -4,7 +4,8 @@ import math
 import logging
 import threading
 import time
-import ctypes # <--- 1. 引入 ctypes
+import ctypes
+import itertools # <--- MODIFIED: 引入 itertools
 from typing import Dict, Tuple, Any, List
 from concurrent.futures import Future
 from queue import Queue, Empty
@@ -14,16 +15,23 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s [%(
 # --- Module Globals ---
 _spdk_initialized = False
 _BLOB_SIZE_IN_BYTES = 56 * (1024 ** 2)
-_INITIAL_BLOB_COUNT = 4096
-_MAX_TOTAL_BLOB_COUNT = 8192
-_BLOB_REPOPULATE_BATCH_SIZE = 512
+_INITIAL_BLOB_COUNT = 8192
+_MAX_TOTAL_BLOB_COUNT = 8192 * 4
+_BLOB_REPOPULATE_BATCH_SIZE = _INITIAL_BLOB_COUNT // 4
 _LOW_WATER_MARK = _INITIAL_BLOB_COUNT // 4
 _completion_loop: asyncio.AbstractEventLoop = None
 _completion_thread: threading.Thread = None
 _free_blobs_queue: Queue[int] = Queue()
-_thread_local_storage = threading.local()
-_thread_map: Dict[int, int] = {} 
-_thread_map_lock = threading.Lock()
+
+# --- DELETED ---: 移除了线程映射相关的全局变量
+# _thread_local_storage = threading.local()
+# _thread_map: Dict[int, int] = {} 
+# _thread_map_lock = threading.Lock()
+
+# --- MODIFIED: 新的轮询调度器全局变量 ---
+_worker_count = 0
+_worker_rr_cycler = None  # 使用 itertools.cycle 实现高效线程安全的轮询
+
 _all_blob_ids: List[int] = []
 _all_blob_handles: List[int] = []
 _blob_size_in_clusters = 0
@@ -71,33 +79,13 @@ def _submit_meta_op_blocking(spdk_func, *args) -> Any:
     _completion_loop.call_soon_threadsafe(do_submit)
     return future.result(timeout=20)
 
-def _get_or_register_worker_id() -> int:
+def _get_next_worker_id() -> int:
     """
-    Implicitly registers the current thread with SPDK if not already done.
-    Uses threading.local() for fast, lock-free caching of the worker_id.
+    通过线程安全的轮询策略获取下一个 worker ID。
     """
-    # Fast path: 尝试从线程局部存储中获取 worker_id，此路径无锁、无字典查询。
-    try:
-        return _thread_local_storage.worker_id
-    except AttributeError:
-        # Slow path: 当前线程第一次调用，需要注册。
-        thread_id = threading.get_ident()
-        
-        # 锁仍然是必要的，以防止多个*新*线程同时尝试注册，导致C层被调用多次。
-        with _thread_map_lock:
-            # 双重检查：可能在等待锁的时候，此线程已经被其他操作注册了。
-            worker_id = _thread_map.get(thread_id)
-            if worker_id is None:
-                # 确定需要注册，调用C API
-                worker_id = spdk_blob.register_io_thread()
-                if worker_id < 0:
-                     raise RuntimeError(f"Failed to register thread {thread_id} with SPDK.")
-                _thread_map[thread_id] = worker_id
-                logging.info(f"Implicitly registered thread {thread_id} to SPDK Worker {worker_id}.")
-        
-        # 将获取到的 worker_id 存入线程局部存储，以便下次快速返回。
-        _thread_local_storage.worker_id = worker_id
-        return worker_id
+    if not _worker_rr_cycler:
+        raise RuntimeError("SPDK worker pool is not initialized. Call init() first.")
+    return next(_worker_rr_cycler)
 
 async def _submit_meta_op_async(spdk_func, *args) -> Any:
     """Helper to call an async metadata op and await its result in an async context."""
@@ -158,7 +146,9 @@ def _trigger_repopulation():
 # --- Public API ---
 def init(bdev_name: str, json_config_path: str, reactor_mask: str, sock: str) -> None:
     """Initializes the SPDK environment and resources."""
-    global _spdk_initialized, _completion_thread, _all_blob_ids, _all_blob_handles, _blob_size_in_clusters
+    global _spdk_initialized, _completion_thread, _all_blob_ids, _all_blob_handles
+    global _blob_size_in_clusters, _worker_count, _worker_rr_cycler # <-- MODIFIED
+
     if _spdk_initialized: return
     _completion_thread = threading.Thread(target=_completion_loop_runner, name="SPDK-Completion-Thread", daemon=True)
     _completion_thread.start()
@@ -166,6 +156,14 @@ def init(bdev_name: str, json_config_path: str, reactor_mask: str, sock: str) ->
         time.sleep(0.01)
     spdk_blob.init(bdev_name, json_config_path, reactor_mask, sock, _completion_loop)
     _spdk_initialized = True
+    
+    _worker_count = spdk_blob.get_worker_count()
+    if _worker_count <= 0:
+        unload()
+        raise RuntimeError(f"SPDK initialized with zero I/O workers. Check reactor_mask: {reactor_mask}")
+    _worker_rr_cycler = itertools.cycle(range(_worker_count))
+    logging.info(f"SPDK initialized with {_worker_count} I/O workers. Round-robin scheduler is ready.")
+    
     page_size = get_page_size()
     cluster_size = get_cluster_size()
     io_unit = get_io_unit_size()
@@ -187,7 +185,7 @@ def init(bdev_name: str, json_config_path: str, reactor_mask: str, sock: str) ->
 
 def unload() -> None:
     """Gracefully shuts down all resources and unloads SPDK."""
-    global _spdk_initialized, _completion_loop, _completion_thread
+    global _spdk_initialized, _completion_loop, _completion_thread, _worker_count, _worker_rr_cycler # <-- MODIFIED
     if not _spdk_initialized: return
     logging.info("Cleaning up global blob pool...")
     try:
@@ -203,28 +201,18 @@ def unload() -> None:
     _all_blob_ids.clear()
     spdk_blob.unload()
     _spdk_initialized = False
+
+    _worker_count = 0      # <-- MODIFIED
+    _worker_rr_cycler = None # <-- MODIFIED
+
     if _completion_loop and _completion_loop.is_running():
         _completion_loop.call_soon_threadsafe(_completion_loop.stop)
     if _completion_thread:
         _completion_thread.join()
     _completion_loop = None
     _completion_thread = None
-    _thread_map.clear()
     logging.info("SPDK unload complete.")
 
-def cleanup_current_thread():
-    """Optional API to manually clean up the current thread's SPDK binding."""
-    thread_id = threading.get_ident()
-    with _thread_map_lock:
-        if thread_id in _thread_map:
-            spdk_blob.unregister_io_thread()
-            del _thread_map[thread_id]
-            # También limpiar el caché local del hilo si existe
-            try:
-                del _thread_local_storage.worker_id
-            except AttributeError:
-                pass
-            logging.info(f"Cleaned up registration for thread {thread_id}.")
 
 def get_blob(timeout: float = 5.0) -> int:
     """
@@ -247,7 +235,7 @@ def release_blob(handle: int):
 def write_async(handle: int, ptr: int, offset_bytes: int, size_bytes: int) -> Future:
     """Asynchronously write data to a blob."""
     if not _spdk_initialized: raise RuntimeError("SPDK is not initialized.")
-    worker_id = _get_or_register_worker_id()
+    worker_id = _get_next_worker_id() # <--- MODIFIED
     io_unit_size = get_io_unit_size()
     offset_units = offset_bytes // io_unit_size
     num_units = size_bytes // io_unit_size
@@ -258,7 +246,7 @@ def write_async(handle: int, ptr: int, offset_bytes: int, size_bytes: int) -> Fu
 def read_async(handle: int, ptr: int, offset_bytes: int, size_bytes: int) -> Future:
     """Asynchronously read data from a blob."""
     if not _spdk_initialized: raise RuntimeError("SPDK is not initialized.")
-    worker_id = _get_or_register_worker_id()
+    worker_id = _get_next_worker_id() # <--- MODIFIED
     io_unit_size = get_io_unit_size()
     offset_units = offset_bytes // io_unit_size
     num_units = size_bytes // io_unit_size
@@ -276,14 +264,11 @@ def write_batch_async(requests: List[Tuple[int, int, int, int]]) -> Future:
         f.set_result(None)
         return f
     
-    worker_id = _get_or_register_worker_id()
+    worker_id = _get_next_worker_id() # <--- MODIFIED
     io_unit_size = get_io_unit_size()
     batch_size = len(requests)
-    
-    # 在 Python 端创建 C 内存布局的数组
     c_requests_array = (_C_IO_Request * batch_size)()
 
-    # 高效地填充这块内存
     for i, (handle, ptr, offset, size) in enumerate(requests):
         req = c_requests_array[i]
         req.handle = handle
@@ -291,11 +276,9 @@ def write_batch_async(requests: List[Tuple[int, int, int, int]]) -> Future:
         req.offset_units = offset // io_unit_size
         req.num_units = size // io_unit_size
     
-    # 获取指向这块内存的指针
     array_ptr = ctypes.addressof(c_requests_array)
     
     future = Future()
-    # 调用新的 C API，只传递指针和长度
     spdk_blob.write_batch_async(worker_id, array_ptr, batch_size, future)
     return future
 
@@ -309,10 +292,9 @@ def read_batch_async(requests: List[Tuple[int, int, int, int]]) -> Future:
         f.set_result(None)
         return f
 
-    worker_id = _get_or_register_worker_id()
+    worker_id = _get_next_worker_id()
     io_unit_size = get_io_unit_size()
     batch_size = len(requests)
-
     c_requests_array = (_C_IO_Request * batch_size)()
 
     for i, (handle, ptr, offset, size) in enumerate(requests):

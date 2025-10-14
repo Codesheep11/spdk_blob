@@ -2,6 +2,8 @@
 #include <Python.h>
 #include "spdk_wrapper.h"
 
+uint32_t c_api_get_worker_count(void);
+
 typedef struct
 {
     spdk_blob_handle handle;
@@ -34,21 +36,9 @@ static PyObject *py_c_api_unload(PyObject *self, PyObject *Py_UNUSED(ignored))
     return retcode_to_py(c_api_unload());
 }
 
-static PyObject *py_c_api_register_io_thread(PyObject *self, PyObject *Py_UNUSED(ignored))
+static PyObject *py_c_api_get_worker_count(PyObject *self, PyObject *Py_UNUSED(ignored))
 {
-    int worker_id = c_api_register_io_thread();
-    if (worker_id < 0)
-    {
-        PyErr_SetString(PyExc_RuntimeError, "Failed to register IO thread and bind SPDK worker.");
-        return NULL;
-    }
-    return PyLong_FromLong(worker_id);
-}
-
-static PyObject *py_c_api_unregister_io_thread(PyObject *self, PyObject *Py_UNUSED(ignored))
-{
-    c_api_unregister_io_thread();
-    Py_RETURN_NONE;
+    return PyLong_FromLong(c_api_get_worker_count());
 }
 
 static PyObject *py_c_api_create_async(PyObject *self, PyObject *args)
@@ -150,11 +140,10 @@ static PyObject *py_c_api_read_async(PyObject *self, PyObject *args)
 static PyObject *py_c_api_submit_batch_async_internal(PyObject *args, bool is_read)
 {
     int worker_id;
-    unsigned long long requests_ptr_val; // 用于接收指针地址
+    unsigned long long requests_ptr_val;
     int count;
     PyObject *future;
 
-    // K (unsigned long long) 用于安全地接收来自ctypes的64位地址
     if (!PyArg_ParseTuple(args, "iKiO", &worker_id, &requests_ptr_val, &count, &future))
     {
         PyErr_SetString(PyExc_TypeError, "Invalid arguments for batch operation. Expected (worker_id, ptr, count, future).");
@@ -163,14 +152,11 @@ static PyObject *py_c_api_submit_batch_async_internal(PyObject *args, bool is_re
 
     if (count == 0)
     {
-        // 如果批次为空，直接返回，Python层会处理future
         Py_RETURN_NONE;
     }
 
-    // 将传入的内存地址转为 C 结构体数组指针
     c_py_io_request *py_requests = (c_py_io_request *)requests_ptr_val;
 
-    // 从 worker 的对象池中分配 io_request_context_t 指针数组
     io_request_context_t **c_contexts = malloc(count * sizeof(io_request_context_t *));
     if (!c_contexts)
     {
@@ -180,7 +166,6 @@ static PyObject *py_c_api_submit_batch_async_internal(PyObject *args, bool is_re
     Py_ssize_t allocated_count = 0;
     bool error_occurred = false;
 
-    // 4. 不再有 Python API 调用，直接在 C 层面高效循环
     for (int i = 0; i < count; i++)
     {
         io_request_context_t *ctx = c_api_alloc_io_request_ctx(worker_id);
@@ -192,7 +177,6 @@ static PyObject *py_c_api_submit_batch_async_internal(PyObject *args, bool is_re
         }
         c_contexts[allocated_count++] = ctx;
 
-        // 直接从 C 结构体中拷贝数据，没有 PyObject 解析！
         ctx->handle = py_requests[i].handle;
         ctx->payload = py_requests[i].payload;
         ctx->offset_io_units = py_requests[i].offset_units;
@@ -210,24 +194,20 @@ static PyObject *py_c_api_submit_batch_async_internal(PyObject *args, bool is_re
         return NULL;
     }
 
-    // 调用核心 C API 提交批量请求
     c_api_submit_batch_io_async(worker_id, c_contexts, (uint32_t)count, future);
 
-    // c_contexts 数组本身可以被释放，因为它的内容已经被消息系统拷贝或消费。
     free(c_contexts);
     Py_RETURN_NONE;
 }
 
-// py_c_api_write_batch_async 现在只是一个简单的包装
 static PyObject *py_c_api_write_batch_async(PyObject *self, PyObject *args)
 {
-    return py_c_api_submit_batch_async_internal(args, false); // is_read = false
+    return py_c_api_submit_batch_async_internal(args, false);
 }
 
-// py_c_api_read_batch_async 也是一个简单的包装
 static PyObject *py_c_api_read_batch_async(PyObject *self, PyObject *args)
 {
-    return py_c_api_submit_batch_async_internal(args, true); // is_read = true
+    return py_c_api_submit_batch_async_internal(args, true);
 }
 
 // --- 辅助函数 ---
@@ -292,8 +272,6 @@ PyMODINIT_FUNC PyInit_spdk_blob(void);
 static PyMethodDef SpdkMethods[] = {
     {"init", py_c_api_init, METH_VARARGS, "Initialize the SPDK environment, optionally with an RPC socket."},
     {"unload", py_c_api_unload, METH_NOARGS, "Shut down the SPDK environment."},
-    {"register_io_thread", py_c_api_register_io_thread, METH_NOARGS, "Register the calling thread for I/O and get a dedicated worker ID."},
-    {"unregister_io_thread", py_c_api_unregister_io_thread, METH_NOARGS, "Unregister the calling thread."},
     {"create_async", py_c_api_create_async, METH_VARARGS, "Asynchronously create a blob."},
     {"delete_async", py_c_api_delete_async, METH_VARARGS, "Asynchronously delete a blob."},
     {"open_async", py_c_api_open_async, METH_VARARGS, "Asynchronously open a blob."},
@@ -302,6 +280,7 @@ static PyMethodDef SpdkMethods[] = {
     {"read_async", py_c_api_read_async, METH_VARARGS, "Asynchronously read from a blob on a specific worker."},
     {"write_batch_async", py_c_api_write_batch_async, METH_VARARGS, "Asynchronously write a batch of requests using a ctypes buffer pointer."},
     {"read_batch_async", py_c_api_read_batch_async, METH_VARARGS, "Asynchronously read a batch of requests using a ctypes buffer pointer."},
+    {"get_worker_count", py_c_api_get_worker_count, METH_NOARGS, "Get the total number of SPDK I/O worker threads."},
     {"get_page_size", py_c_api_get_page_size, METH_NOARGS, "Get page size."},
     {"get_cluster_size", py_c_api_get_cluster_size, METH_NOARGS, "Get cluster size."},
     {"get_free_cluster_count", py_c_api_get_free_cluster_count, METH_NOARGS, "Get free cluster count."},
