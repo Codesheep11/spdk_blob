@@ -567,7 +567,6 @@ static uint32_t count_set_bits(unsigned long long n)
 }
 
 // --- 公开 API 实现 ---
-// --- MODIFIED ---
 uint32_t c_api_get_worker_count(void)
 {
     return g_num_worker_threads;

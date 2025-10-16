@@ -2,181 +2,190 @@ import os
 import sys
 import logging
 import time
-import subprocess
 import json
+import socket
 
-# 定义全局常量
-BDEV_NAME = "Nvme0n1" 
-# BDEV_NAME = "Raid0" 
-RPC_SCRIPT_PATH = "/home/yangxc/project/KVCache/spdk/scripts/rpc.py" # SPDK rpc.py脚本的路径
-SOCK_PATH = "/var/tmp/spdk_test_api.sock" # SPDK RPC Unix套接字路径
-OUTPUT_FILE = "tmp.txt" # 输出文件，用于保存监控数据
+# ==============================================================================
+# 全局静态配置区域
+# ==============================================================================
+# BDEV_NAME = "Nvme0n1" 
+BDEV_NAME = "Raid0"
+SOCK_PATH = "/var/tmp/spdk_micro_test.sock"
+# SOCK_PATH = "/var/tmp/spdk_test_api.sock"
+# SOCK_PATH = "/var/tmp/spdk_kvcache.sock"
+OUTPUT_FILE = "tmp.txt" # 输出文件，恢复为 .txt 格式
+POLL_INTERVAL_S = 0.1   # 轮询间隔（秒）
+# ==============================================================================
 
-# 定义轮询和RPC超时相关的常量
-# 轮询间隔更改为0.1秒
-POLL_INTERVAL_S = 0.1 # I/O数据获取的轮询间隔（秒）
-INITIAL_RPC_TIMEOUT_S = 10 # 初始RPC调用的超时时间（秒）
-POLL_RPC_TIMEOUT_S = 5 # 持续监控时，每次RPC调用的超时时间（秒）
-
-# 配置日志记录器，设置日志级别和格式
+# 配置日志记录器
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 
+class SpdkRpcClient:
+    """一个通过原生Socket与SPDK RPC服务器通信的客户端。"""
+    def __init__(self, sock_path: str):
+        if not os.path.exists(sock_path):
+            raise FileNotFoundError(f"SPDK RPC socket not found at: {sock_path}")
+        self.sock_path = sock_path
+        self.sock = None
+        self.request_id = 1
 
-def get_bdev_iostat(sock_path: str, bdev_name: str, rpc_timeout: int, log_errors: bool = True) -> dict | None:
-    """
-    通过SPDK RPC获取指定Bdev的I/O统计信息。
-    此版本正确处理'ticks'和'tick_rate'在JSON顶层的情况。
+    def _connect(self):
+        """建立到Unix-domain socket的连接。"""
+        try:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.connect(self.sock_path)
+        except (ConnectionRefusedError, FileNotFoundError) as e:
+            logging.error(f"Failed to connect to SPDK socket '{self.sock_path}': {e}")
+            self.sock = None
+            raise
 
-    Args:
-        sock_path: SPDK RPC套接字的路径。
-        bdev_name: 要查询的Bdev名称。
-        rpc_timeout: RPC调用失败时的重试总超时时间（秒）。
-        log_errors: 是否在失败时记录错误日志。
+    def _send_request(self, method: str, params: dict = None) -> dict | None:
+        """发送JSON-RPC请求并获取响应。"""
+        if not self.sock:
+            try:
+                self._connect()
+            except Exception:
+                return None
 
-    Returns:
-        如果成功，返回包含'bytes_read'、'bytes_written'、'ticks'和'tick_rate'的字典；
-        否则返回None。
-    """
-    # 检查rpc.py脚本路径是否存在
-    if not os.path.exists(RPC_SCRIPT_PATH):
-        if log_errors:
-            logging.error(f"SPDK RPC script not found at: {RPC_SCRIPT_PATH}")
+        request = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "id": self.request_id,
+        }
+        if params:
+            request["params"] = params
+        
+        try:
+            self.sock.sendall(json.dumps(request).encode('utf-8'))
+            self.request_id += 1
+            
+            response_data = self.sock.recv(8192 * 4).decode('utf-8')
+            response_json = response_data.split('\n')[0]
+            return json.loads(response_json)
+        except (BrokenPipeError, ConnectionResetError, json.JSONDecodeError) as e:
+            logging.warning(f"RPC communication error: {e}. Reconnecting...")
+            self.close()
+            return None
+        except Exception as e:
+            logging.error(f"An unexpected RPC error occurred: {e}")
+            self.close()
+            return None
+
+    def get_bdev_iostat(self, bdev_name: str = None) -> dict | None:
+        """获取bdev的iostat信息。"""
+        params = {}
+        if bdev_name:
+            params['name'] = bdev_name
+        
+        response = self._send_request("bdev_get_iostat", params)
+        
+        if response and "result" in response:
+            return response["result"]
+        
+        if response and "error" in response:
+            logging.error(f"RPC error: {response['error']['message']}")
+
         return None
 
-    # 构建调用rpc.py脚本的命令行
-    command = [
-        sys.executable, # 使用当前Python解释器
-        RPC_SCRIPT_PATH,
-        "-s", sock_path, # 指定SPDK套接字
-        "bdev_get_iostat", # RPC方法：获取iostat
-        "-b", bdev_name, # 指定Bdev设备
-    ]
+    def close(self):
+        """关闭socket连接。"""
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+
+
+def monitor_bdev(bdev_name: str, sock_path: str, interval: float, output_file: str):
+    """主监控循环函数。"""
+    logging.info(f"Connecting to SPDK RPC at '{sock_path}'...")
+    try:
+        rpc_client = SpdkRpcClient(sock_path)
+    except FileNotFoundError:
+        sys.exit(1)
+
+    logging.info(f"Attempting to get initial stats for Bdev '{bdev_name}'...")
+    initial_data = rpc_client.get_bdev_iostat()
+    if not initial_data or not any(b.get("name") == bdev_name for b in initial_data.get("bdevs", [])):
+        logging.error(f"Could not get initial stats or Bdev '{bdev_name}' not found. Exiting.")
+        rpc_client.close()
+        return
+
+    ticks_rate = initial_data.get("tick_rate", 0)
+    if ticks_rate == 0:
+        logging.error("tick_rate is 0, cannot calculate bandwidth. Exiting.")
+        rpc_client.close()
+        return
+
+    last_stats = next((bdev for bdev in initial_data["bdevs"] if bdev["name"] == bdev_name), None)
     
-    start_time = time.time()
-    # 循环重试，直到超时
-    while time.time() - start_time < rpc_timeout:
-        try:
-            # 运行子进程命令
-            result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=5)
-            data = json.loads(result.stdout)
+    last_ticks = initial_data.get("ticks", 0)
+    last_bytes_read = last_stats.get("bytes_read", 0)
+    last_bytes_written = last_stats.get("bytes_written", 0)
 
-            # 从顶层获取 ticks 和 tick_rate
-            ticks = data.get("ticks", 0)
-            tick_rate = data.get("tick_rate", 0)
-
-            # 遍历JSON数据中的所有Bdev统计信息
-            for bdev_stats in data.get("bdevs", []):
-                # 找到与目标Bdev名称匹配的条目
-                if bdev_stats.get("name") == bdev_name:
-                    # 返回包含所有必要数据的字典
-                    return {
-                        "bytes_read": bdev_stats.get("bytes_read", 0),
-                        "bytes_written": bdev_stats.get("bytes_written", 0),
-                        "ticks": ticks,
-                        "tick_rate": tick_rate
-                    }
-            
-            # 如果没有找到指定的Bdev
-            if log_errors:
-                logging.error(f"Bdev '{bdev_name}' not found in RPC iostat output. Retrying...")
-            # 短暂休眠后重试
-            time.sleep(0.5)
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            # 捕获子进程执行失败或JSON解析失败的异常
-            if log_errors:
-                logging.warning(f"RPC call failed. Retrying...")
-            # 短暂休眠后重试
-            time.sleep(0.5)
-        except Exception as e:
-            # 捕获所有其他意外异常
-            if log_errors:
-                logging.error(f"An unexpected error occurred during RPC call: {e}")
-            break # 出现意外错误则退出循环
-
-    # 如果重试超时仍未成功，记录错误并返回None
-    if log_errors:
-        logging.error(f"Failed to get Bdev stats after {rpc_timeout} seconds of retries. Exiting...")
-    return None
-
-
-def main():
-    """
-    脚本主函数
-    """
-    # 在开始前再次检查RPC脚本路径
-    if not os.path.exists(RPC_SCRIPT_PATH):
-        sys.exit(f"ERROR: Please edit 'RPC_SCRIPT_PATH' in this script to point to your 'rpc.py'.")
-
-    logging.info("Starting Bdev I/O monitoring script.")
-    logging.info(f"Monitoring '{BDEV_NAME}' and writing data to '{OUTPUT_FILE}'.")
-
-    # 获取初始I/O统计数据，使用较长的超时时间
-    logging.info(f"Attempting to get initial Bdev stats (timeout: {INITIAL_RPC_TIMEOUT_S}s)...")
-    last_stats = get_bdev_iostat(SOCK_PATH, BDEV_NAME, rpc_timeout=INITIAL_RPC_TIMEOUT_S, log_errors=False)
-    if not last_stats:
-        # 如果初始获取失败，则退出脚本
-        sys.exit("Could not get initial Bdev stats. Exiting.")
-    logging.info("Successfully find RPC socket and got initial Bdev stats.")
-    # 记录初始的读写字节数和ticks
-    last_bytes_read = last_stats['bytes_read']
-    last_bytes_written = last_stats['bytes_written']
-    last_ticks = last_stats['ticks']
-    
-    # 记录脚本开始时间
+    logging.info(f"Successfully got initial stats. Starting monitoring and writing to '{output_file}'.")
     start_time = time.perf_counter()
 
     try:
-        # 使用'w'模式打开文件，写入CSV头
-        with open(OUTPUT_FILE, 'w') as f:
-            # 写入标题行，并使用固定宽度对齐
-            f.write(f"{'Elapsed_Time_s(float)':<20}{'Read_BW_MB/s(float)':<20}{'Write_BW_MB/s(float)':<20}\n")
-            # 无限循环，进行持续监控
+        with open(output_file, 'w') as f:
+            # 写入与原始脚本完全一致的标题行
+            f.write(f"{'Elapsed_Time_s':<20}{'Read_BW_MiB/s':<20}{'Write_BW_MiB/s':<20}\n")
+
             while True:
-                # 轮询间隔休眠
-                time.sleep(POLL_INTERVAL_S)
+                time.sleep(interval)
 
-                # 获取当前I/O统计数据
-                current_stats = get_bdev_iostat(SOCK_PATH, BDEV_NAME, rpc_timeout=POLL_RPC_TIMEOUT_S, log_errors=True)
+                all_stats = rpc_client.get_bdev_iostat()
+                if not all_stats:
+                    logging.error("Failed to get I/O stats from SPDK. Retrying...")
+                    continue
 
-                if current_stats is None:
-                    # 如果RPC调用失败，记录错误并退出循环
-                    logging.error("Lost connection to SPDK RPC socket. Exiting monitoring.")
-                    break # RPC失败时退出循环
+                current_stats = next((bdev for bdev in all_stats.get("bdevs", []) if bdev["name"] == bdev_name), None)
+                if not current_stats:
+                    logging.warning(f"Bdev '{bdev_name}' not found in current stats. Skipping.")
+                    continue
+                
+                current_ticks = all_stats.get("ticks", 0)
+                
+                if current_ticks < last_ticks:
+                    logging.warning("Ticks counter may have wrapped around or reset. Skipping one interval.")
+                    last_ticks = current_ticks
+                    continue
 
-                # 计算两次统计之间的ticks差
-                current_ticks = current_stats['ticks']
-                ticks_rate = current_stats['tick_rate']
                 delta_ticks = current_ticks - last_ticks
-                
-                # 计算时间间隔（秒），防止除以0
-                delta_time_s = delta_ticks / ticks_rate if ticks_rate > 0 else 0
-                
-                # 仅在有时间变化时计算和记录
+                delta_time_s = delta_ticks / ticks_rate
+
                 if delta_time_s > 0:
-                    # 计算两次统计之间的读写字节数差
                     delta_bytes_read = current_stats['bytes_read'] - last_bytes_read
                     delta_bytes_written = current_stats['bytes_written'] - last_bytes_written
-                    
-                    # 计算读写带宽（MB/s）
-                    # 1024 * 1024 转换为兆字节
                     read_bw_mbs = (delta_bytes_read / (1024 * 1024)) / delta_time_s
                     write_bw_mbs = (delta_bytes_written / (1024 * 1024)) / delta_time_s
                     
-                    # 写入数据行，使用固定宽度对齐并保留两位小数
                     elapsed_time = time.perf_counter() - start_time
+                    
+                    # 写入与原始脚本完全一致的数据行格式
                     f.write(f"{elapsed_time:<20.2f}{read_bw_mbs:<20.2f}{write_bw_mbs:<20.2f}\n")
-                    f.flush() # 立即将数据写入文件
-                
-                # 更新上一次的读写字节数和ticks，为下一次循环做准备
+                    f.flush()
+
                 last_bytes_read = current_stats['bytes_read']
                 last_bytes_written = current_stats['bytes_written']
                 last_ticks = current_ticks
 
     except KeyboardInterrupt:
-        # 捕获Ctrl+C中断，优雅地退出脚本
         logging.info("Monitoring stopped by user.")
+    finally:
+        rpc_client.close()
+        logging.info("RPC client closed.")
+
+
+def main():
+    """
+    脚本主函数，使用全局静态常量进行配置
+    """
+    monitor_bdev(
+        bdev_name=BDEV_NAME,
+        sock_path=SOCK_PATH,
+        interval=POLL_INTERVAL_S,
+        output_file=OUTPUT_FILE
+    )
 
 
 if __name__ == "__main__":
-    # 如果脚本作为主程序运行，则调用main函数
     main()

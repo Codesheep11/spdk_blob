@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 import ctypes
-import itertools # <--- MODIFIED: 引入 itertools
+import itertools
 from typing import Dict, Tuple, Any, List
 from concurrent.futures import Future
 from queue import Queue, Empty
@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s [%(
 # --- Module Globals ---
 _spdk_initialized = False
 _BLOB_SIZE_IN_BYTES = 56 * (1024 ** 2)
-_INITIAL_BLOB_COUNT = 8192
+_INITIAL_BLOB_COUNT = 8192 + 2048
 _MAX_TOTAL_BLOB_COUNT = 8192 * 4
 _BLOB_REPOPULATE_BATCH_SIZE = _INITIAL_BLOB_COUNT // 4
 _LOW_WATER_MARK = _INITIAL_BLOB_COUNT // 4
@@ -23,14 +23,8 @@ _completion_loop: asyncio.AbstractEventLoop = None
 _completion_thread: threading.Thread = None
 _free_blobs_queue: Queue[int] = Queue()
 
-# --- DELETED ---: 移除了线程映射相关的全局变量
-# _thread_local_storage = threading.local()
-# _thread_map: Dict[int, int] = {} 
-# _thread_map_lock = threading.Lock()
-
-# --- MODIFIED: 新的轮询调度器全局变量 ---
 _worker_count = 0
-_worker_rr_cycler = None  # 使用 itertools.cycle 实现高效线程安全的轮询
+_worker_rr_cycler = None
 
 _all_blob_ids: List[int] = []
 _all_blob_handles: List[int] = []
@@ -235,7 +229,7 @@ def release_blob(handle: int):
 def write_async(handle: int, ptr: int, offset_bytes: int, size_bytes: int) -> Future:
     """Asynchronously write data to a blob."""
     if not _spdk_initialized: raise RuntimeError("SPDK is not initialized.")
-    worker_id = _get_next_worker_id() # <--- MODIFIED
+    worker_id = _get_next_worker_id() 
     io_unit_size = get_io_unit_size()
     offset_units = offset_bytes // io_unit_size
     num_units = size_bytes // io_unit_size
@@ -246,7 +240,7 @@ def write_async(handle: int, ptr: int, offset_bytes: int, size_bytes: int) -> Fu
 def read_async(handle: int, ptr: int, offset_bytes: int, size_bytes: int) -> Future:
     """Asynchronously read data from a blob."""
     if not _spdk_initialized: raise RuntimeError("SPDK is not initialized.")
-    worker_id = _get_next_worker_id() # <--- MODIFIED
+    worker_id = _get_next_worker_id() 
     io_unit_size = get_io_unit_size()
     offset_units = offset_bytes // io_unit_size
     num_units = size_bytes // io_unit_size
@@ -258,13 +252,14 @@ def write_batch_async(requests: List[Tuple[int, int, int, int]]) -> Future:
     """
     Asynchronously write a batch of data to blobs using a zero-copy ctypes buffer.
     """
+    # print(f"write {len(requests)} kvchunks to spdk backend")
     if not _spdk_initialized: raise RuntimeError("SPDK is not initialized.")
     if not requests:
         f = Future()
         f.set_result(None)
         return f
     
-    worker_id = _get_next_worker_id() # <--- MODIFIED
+    worker_id = _get_next_worker_id()
     io_unit_size = get_io_unit_size()
     batch_size = len(requests)
     c_requests_array = (_C_IO_Request * batch_size)()
@@ -286,6 +281,7 @@ def read_batch_async(requests: List[Tuple[int, int, int, int]]) -> Future:
     """
     Asynchronously read a batch of data from blobs using a zero-copy ctypes buffer.
     """
+    # print(f"read {len(requests)} kvchunks from spdk backend")
     if not _spdk_initialized: raise RuntimeError("SPDK is not initialized.")
     if not requests:
         f = Future()

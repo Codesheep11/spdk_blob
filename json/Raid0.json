@@ -28,6 +28,14 @@
                     }
                 },
                 {
+                    "method": "bdev_nvme_attach_controller",
+                    "params": {
+                        "name": "Nvme3",
+                        "trtype": "PCIe",
+                        "traddr": "0000:4c:00.0"
+                    }
+                },
+                {
                     "method": "bdev_raid_create",
                     "params": {
                         "name": "Raid0",
@@ -36,7 +44,8 @@
                         "base_bdevs": [
                             "Nvme0n1",
                             "Nvme1n1",
-                            "Nvme2n1"
+                            "Nvme2n1",
+                            "Nvme3n1"
                         ]
                     }
                 }
