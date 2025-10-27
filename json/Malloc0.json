@@ -7,7 +7,7 @@
                     "method": "bdev_malloc_create",
                     "params": {
                         "name": "Malloc0",
-                        "num_blocks": 262144,
+                        "num_blocks": 26214400,
                         "block_size": 512
                     }
                 }

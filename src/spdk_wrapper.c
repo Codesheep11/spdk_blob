@@ -477,6 +477,7 @@ static void *spdk_thread_func(void *arg)
     opts.json_config_file = args->json_config_file;
     opts.reactor_mask = args->reactor_mask;
     opts.rpc_addr = args->sock;
+    opts.main_core = args->main_core;
     g_spdk_thread_rc = spdk_app_start(&opts, spdk_app_main, args);
     free(args->bdev_name);
     free(args->json_config_file);
@@ -572,7 +573,7 @@ uint32_t c_api_get_worker_count(void)
     return g_num_worker_threads;
 }
 
-int c_api_init(const char *bdev_name, const char *json_config_file, const char *reactor_mask, const char *sock, PyObject *completion_loop)
+int c_api_init(const char *bdev_name, const char *json_config_file, const char *reactor_mask, const char *sock, PyObject *completion_loop, uint32_t main_core)
 {
     if (g_spdk_thread_id != 0)
         return -1;
@@ -613,6 +614,7 @@ int c_api_init(const char *bdev_name, const char *json_config_file, const char *
     args->json_config_file = strdup(json_config_file);
     args->reactor_mask = strdup(reactor_mask);
     args->sock = strdup(sock);
+    args->main_core = main_core;
 
     if (!args->bdev_name || !args->json_config_file || !args->reactor_mask || !args->sock)
     {

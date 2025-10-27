@@ -138,17 +138,29 @@ def _trigger_repopulation():
 
 
 # --- Public API ---
-def init(bdev_name: str, json_config_path: str, reactor_mask: str, sock: str) -> None:
+def init(bdev_name: str, json_config_path: str, reactor_mask: str, main_core: int, sock: str) -> None:
     """Initializes the SPDK environment and resources."""
     global _spdk_initialized, _completion_thread, _all_blob_ids, _all_blob_handles
-    global _blob_size_in_clusters, _worker_count, _worker_rr_cycler # <-- MODIFIED
+    global _blob_size_in_clusters, _worker_count, _worker_rr_cycler
 
     if _spdk_initialized: return
+
+    if main_core < 0:
+        raise ValueError(f"main_core must be a non-negative integer, but got {main_core}")
+        
+    try:
+        mask_int = int(reactor_mask, 16)
+    except ValueError:
+        raise ValueError(f"Invalid reactor_mask: '{reactor_mask}' is not a valid hex string.")
+        
+    if (1 << main_core) & mask_int == 0:
+        raise ValueError(f"main_core Lcore {main_core} is not set in the reactor_mask '{reactor_mask}' (0b{mask_int:b})")
+
     _completion_thread = threading.Thread(target=_completion_loop_runner, name="SPDK-Completion-Thread", daemon=True)
     _completion_thread.start()
     while not _completion_loop or not _completion_loop.is_running():
         time.sleep(0.01)
-    spdk_blob.init(bdev_name, json_config_path, reactor_mask, sock, _completion_loop)
+    spdk_blob.init(bdev_name, json_config_path, reactor_mask, sock, _completion_loop, main_core)
     _spdk_initialized = True
     
     _worker_count = spdk_blob.get_worker_count()

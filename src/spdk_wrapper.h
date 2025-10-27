@@ -38,6 +38,7 @@ extern "C"
         char *json_config_file;
         char *reactor_mask;
         char *sock;
+        uint32_t main_core;
     } spdk_thread_args_t;
 
     typedef struct spdk_async_ctx_s
@@ -119,7 +120,7 @@ extern "C"
     // --- 公开 API 函数声明 ---
 
     // --- 生命周期管理 ---
-    int c_api_init(const char *bdev_name, const char *json_config_file, const char *reactor_mask, const char *sock, PyObject *completion_loop);
+    int c_api_init(const char *bdev_name, const char *json_config_file, const char *reactor_mask, const char *sock, PyObject *completion_loop, uint32_t main_core);
     int c_api_unload(void);
 
     // --- 线程管理 API ---

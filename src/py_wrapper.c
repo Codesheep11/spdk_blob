@@ -1,5 +1,6 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <stdint.h>
 #include "spdk_wrapper.h"
 
 uint32_t c_api_get_worker_count(void);
@@ -26,9 +27,10 @@ static PyObject *py_c_api_init(PyObject *self, PyObject *args)
 {
     const char *bdev, *json, *mask, *sock;
     PyObject *completion_loop;
-    if (!PyArg_ParseTuple(args, "ssssO:init", &bdev, &json, &mask, &sock, &completion_loop))
+    int main_core_int;
+    if (!PyArg_ParseTuple(args, "ssssOi:init", &bdev, &json, &mask, &sock, &completion_loop, &main_core_int))
         return NULL;
-    return retcode_to_py(c_api_init(bdev, json, mask, sock, completion_loop));
+    return retcode_to_py(c_api_init(bdev, json, mask, sock, completion_loop, main_core_int));
 }
 
 static PyObject *py_c_api_unload(PyObject *self, PyObject *Py_UNUSED(ignored))

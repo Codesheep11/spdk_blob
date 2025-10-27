@@ -61,7 +61,7 @@ spdk_libs = [
     "-lspdk_bdev_passthru", "-lspdk_bdev_lvol", "-lspdk_bdev_raid",
     "-lspdk_bdev_error", "-lspdk_bdev_gpt", "-lspdk_bdev_split",
     "-lspdk_bdev_delay", "-lspdk_bdev_zone_block",
-    "-lspdk_blobfs_bdev", "-lspdk_blobfs", "-lspdk_blob_bdev",
+    "-lspdk_blob_bdev",
     "-lspdk_lvol", "-lspdk_blob", "-lspdk_nvme", "-lspdk_bdev_aio",
     "-lspdk_bdev_ftl", "-lspdk_ftl", "-lspdk_bdev_virtio", "-lspdk_virtio",
     "-lspdk_vfio_user", "-lspdk_accel_error", "-lspdk_accel_ioat",
