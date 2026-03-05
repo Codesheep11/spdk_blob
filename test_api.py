@@ -11,12 +11,17 @@ from threading import Lock
 # --- 测试参数 ---
 BDEV_NAME = "Raid0"
 JSON_CONFIG_FILE = "/home/yangxc/project/KVCache/spdk_blob/json/Raid0.json"
-REACTOR_MASK = "0xff0000000000000"
+REACTOR_MASK = "0xff000000000000"
+MAIN_CORE = 48
+# BDEV_NAME = "Raid0"
+# JSON_CONFIG_FILE = "/home/yangxc/project/KVCache/spdk_blob/json/Malloc0.json"
+# REACTOR_MASK = "0x1e"
+# MAIN_CORE = 1
 SOCK_PATH = "/var/tmp/spdk_test_api.sock"
-IO_SIZE_KB = 56 * 1024
+IO_SIZE_KB = 8 * 1024
 TOTAL_OPS_PER_THREAD = 1024
-NUM_TEST_THREADS = 4
-IO_BATCH_SIZE = 128
+NUM_TEST_THREADS = 3
+IO_BATCH_SIZE = 64
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s [%(levelname)s] - %(message)s')
 
@@ -148,8 +153,13 @@ def main():
     if not os.path.exists(JSON_CONFIG_FILE):
         sys.exit(f"ERROR: SPDK config file not found: {JSON_CONFIG_FILE}")
     
-    spdk.init(BDEV_NAME, JSON_CONFIG_FILE, REACTOR_MASK, SOCK_PATH)
-    
+    spdk.init(BDEV_NAME, JSON_CONFIG_FILE, REACTOR_MASK, MAIN_CORE, SOCK_PATH)
+    spdk.set_blob_size_in_bytes(IO_SIZE_KB * 1024)
+    spdk.init_blob_pool()
+
+    # spdk.load(BDEV_NAME, JSON_CONFIG_FILE, REACTOR_MASK, MAIN_CORE, SOCK_PATH)
+    # spdk.set_blob_size_in_bytes(IO_SIZE_KB * 1024)
+    # spdk.recover_and_init_pool([])
     try:
         success = run_test_phase()
         if not success:

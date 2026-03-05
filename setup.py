@@ -2,9 +2,9 @@ from pathlib import Path
 import os
 import shlex
 import subprocess
-from setuptools import setup, Extension
+from setuptools import setup, Extension, find_packages
 
-SPDK_BUILD = Path(os.environ.get("SPDK_BUILD", "/home/yangxc/project/KVCache/spdk/build")).resolve()
+SPDK_BUILD = Path(os.environ.get("SPDK_BUILD", "/home/yangxc/Workspace/expert-kit/kvcache/spdk/build")).resolve()
 SPDK_ROOT = SPDK_BUILD.parent # SPDK 源码根目录
 DPDK_LIB   = SPDK_BUILD.parent / "dpdk" / "build" / "lib"
 ISA_L      = SPDK_BUILD.parent / "isa-l" / ".libs"
@@ -29,7 +29,10 @@ optimization_flags = [
 common_cflags = optimization_flags + common_cflags
 
 common_ldflags = [
-    "-fuse-ld=bfd", "-Wl,-z,relro,-z,now", "-Wl,-z,noexecstack",
+    "-fuse-ld=bfd", 
+    "-Wl,--disable-new-dtags",
+    "-Wl,-z,relro,-z,now",
+    "-Wl,-z,noexecstack",
 ]
 
 # RPATH：运行时自动定位 SPDK / DPDK / ISA-L 库
@@ -75,7 +78,6 @@ spdk_libs = [
     "-lspdk_init", "-lspdk_thread", "-lspdk_trace", "-lspdk_keyring",
     "-lspdk_rpc", "-lspdk_jsonrpc", "-lspdk_json",
     "-lspdk_util", "-lspdk_log",
-    "-lisal","-lisal_crypto",
     "-Wl,--no-whole-archive",
     "-Wl,--as-needed",
 ]
@@ -147,6 +149,7 @@ setup(
     name="spdk_blob",
     version="0.1.0",
     description="Python bindings for SPDK blobstore",
+    packages=find_packages(),
     ext_modules=[module],
     python_requires=">=3.8",
 )

@@ -5,6 +5,8 @@
 
 uint32_t c_api_get_worker_count(void);
 
+spdk_blob_id c_api_get_blob_id(spdk_blob_handle handle);
+
 typedef struct
 {
     spdk_blob_handle handle;
@@ -23,14 +25,24 @@ static PyObject *retcode_to_py(int rc)
     return NULL;
 }
 
-static PyObject *py_c_api_init(PyObject *self, PyObject *args)
+static PyObject *internal_start_spdk(PyObject *args, bool is_load)
 {
     const char *bdev, *json, *mask, *sock;
     PyObject *completion_loop;
     int main_core_int;
-    if (!PyArg_ParseTuple(args, "ssssOi:init", &bdev, &json, &mask, &sock, &completion_loop, &main_core_int))
+    if (!PyArg_ParseTuple(args, "ssssOi", &bdev, &json, &mask, &sock, &completion_loop, &main_core_int))
         return NULL;
-    return retcode_to_py(c_api_init(bdev, json, mask, sock, completion_loop, main_core_int));
+    return retcode_to_py(c_api_start_spdk(bdev, json, mask, sock, completion_loop, main_core_int, is_load));
+}
+
+static PyObject *py_c_api_init(PyObject *self, PyObject *args)
+{
+    return internal_start_spdk(args, false);
+}
+
+static PyObject *py_c_api_load(PyObject *self, PyObject *args)
+{
+    return internal_start_spdk(args, true);
 }
 
 static PyObject *py_c_api_unload(PyObject *self, PyObject *Py_UNUSED(ignored))
@@ -41,6 +53,25 @@ static PyObject *py_c_api_unload(PyObject *self, PyObject *Py_UNUSED(ignored))
 static PyObject *py_c_api_get_worker_count(PyObject *self, PyObject *Py_UNUSED(ignored))
 {
     return PyLong_FromLong(c_api_get_worker_count());
+}
+
+static PyObject *py_c_api_get_blob_id(PyObject *self, PyObject *args)
+{
+    PyObject *handle_obj;
+    if (!PyArg_ParseTuple(args, "O:get_blob_id", &handle_obj))
+        return NULL;
+
+    spdk_blob_handle handle = (spdk_blob_handle)PyLong_AsVoidPtr(handle_obj);
+    if (PyErr_Occurred())
+        return NULL;
+
+    spdk_blob_id id = c_api_get_blob_id(handle);
+    if (id == C_API_INVALID_BLOB_ID)
+    {
+        PyErr_SetString(PyExc_ValueError, "Invalid blob handle");
+        return NULL;
+    }
+    return PyLong_FromUnsignedLongLong((unsigned long long)id);
 }
 
 static PyObject *py_c_api_create_async(PyObject *self, PyObject *args)
@@ -272,7 +303,8 @@ static PyObject *py_c_api_free_io_buffer(PyObject *self, PyObject *args)
 PyMODINIT_FUNC PyInit_spdk_blob(void);
 
 static PyMethodDef SpdkMethods[] = {
-    {"init", py_c_api_init, METH_VARARGS, "Initialize the SPDK environment, optionally with an RPC socket."},
+    {"init", py_c_api_init, METH_VARARGS, "Format and initialize SPDK blobstore."},
+    {"load", py_c_api_load, METH_VARARGS, "Load existing SPDK blobstore."},
     {"unload", py_c_api_unload, METH_NOARGS, "Shut down the SPDK environment."},
     {"create_async", py_c_api_create_async, METH_VARARGS, "Asynchronously create a blob."},
     {"delete_async", py_c_api_delete_async, METH_VARARGS, "Asynchronously delete a blob."},
@@ -283,6 +315,7 @@ static PyMethodDef SpdkMethods[] = {
     {"write_batch_async", py_c_api_write_batch_async, METH_VARARGS, "Asynchronously write a batch of requests using a ctypes buffer pointer."},
     {"read_batch_async", py_c_api_read_batch_async, METH_VARARGS, "Asynchronously read a batch of requests using a ctypes buffer pointer."},
     {"get_worker_count", py_c_api_get_worker_count, METH_NOARGS, "Get the total number of SPDK I/O worker threads."},
+    {"get_blob_id", py_c_api_get_blob_id, METH_VARARGS, "Get the persistent ID for a blob handle."},
     {"get_page_size", py_c_api_get_page_size, METH_NOARGS, "Get page size."},
     {"get_cluster_size", py_c_api_get_cluster_size, METH_NOARGS, "Get cluster size."},
     {"get_free_cluster_count", py_c_api_get_free_cluster_count, METH_NOARGS, "Get free cluster count."},

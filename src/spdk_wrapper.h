@@ -39,6 +39,7 @@ extern "C"
         char *reactor_mask;
         char *sock;
         uint32_t main_core;
+        bool try_load; // [New] Control Init vs Load
     } spdk_thread_args_t;
 
     typedef struct spdk_async_ctx_s
@@ -109,18 +110,17 @@ extern "C"
         io_request_context_t *io_req_freelist;
     } worker_thread_t;
 
-    // 统一的 I/O 消息结构体，用于单次和批量提交
     typedef struct spdk_io_msg
     {
-        io_request_context_t **contexts; // 指向 I/O 请求上下文指针的数组
-        uint32_t count;                  // 数组中的请求数量 (单次IO时为1)
-        batch_io_context_t *batch_ctx;   // 指向批次共享上下文。对于单次IO，此指针为 NULL。
+        io_request_context_t **contexts;
+        uint32_t count;
+        batch_io_context_t *batch_ctx;
     } spdk_io_msg_t;
 
     // --- 公开 API 函数声明 ---
 
     // --- 生命周期管理 ---
-    int c_api_init(const char *bdev_name, const char *json_config_file, const char *reactor_mask, const char *sock, PyObject *completion_loop, uint32_t main_core);
+    int c_api_start_spdk(const char *bdev_name, const char *json_config_file, const char *reactor_mask, const char *sock, PyObject *completion_loop, uint32_t main_core, bool try_load);
     int c_api_unload(void);
 
     // --- 线程管理 API ---
@@ -131,6 +131,9 @@ extern "C"
     int c_api_delete_async(spdk_blob_id blobid, PyObject *future);
     int c_api_open_blob_async(spdk_blob_id blobid, PyObject *future);
     int c_api_close_blob_async(spdk_blob_handle handle, PyObject *future);
+
+    // [New] Get Blob ID
+    spdk_blob_id c_api_get_blob_id(spdk_blob_handle handle);
 
     // --- 异步 I/O API ---
     io_request_context_t *c_api_alloc_io_request_ctx(int worker_id);

@@ -29,7 +29,6 @@
 
 #define ASYNC_CTX_POOL_SIZE 256
 #define IO_REQUEST_POOL_SIZE 4096
-#define MAX_PY_THREADS 128
 #define CACHE_LINE_SIZE 64
 
 // --- 静态函数声明 ---
@@ -164,12 +163,10 @@ static int worker_io_poller(void *arg)
 
         if (req_ctx->is_read)
         {
-            // DEBUG_LOG("Issuing read: handle=%p, offset=%lu, length=%lu", req_ctx->handle, req_ctx->offset_io_units, req_ctx->num_io_units);
             spdk_blob_io_read(req_ctx->handle, worker->channel, req_ctx->payload, req_ctx->offset_io_units, req_ctx->num_io_units, _io_async_cb, req_ctx);
         }
         else
         {
-            // DEBUG_LOG("Issuing write: handle=%p, offset=%lu, length=%lu", req_ctx->handle, req_ctx->offset_io_units, req_ctx->num_io_units);
             spdk_blob_io_write(req_ctx->handle, worker->channel, req_ctx->payload, req_ctx->offset_io_units, req_ctx->num_io_units, _io_async_cb, req_ctx);
         }
     }
@@ -432,10 +429,13 @@ static void start_worker_threads(void)
     }
     spdk_thread_send_msg(g_main_spdk_thread, _check_workers_ready, NULL);
 }
-static void bs_init_cb(void *cb_arg, struct spdk_blob_store *bs, int bserrno)
+
+// [Modified] Callback for both Init and Load success
+static void bs_start_cb(void *cb_arg, struct spdk_blob_store *bs, int bserrno)
 {
     if (bserrno != 0)
     {
+        SPDK_ERRLOG("Blobstore start (init/load) failed: %d\n", bserrno);
         g_spdk_init_failed = true;
         spdk_app_stop(bserrno);
         return;
@@ -466,8 +466,19 @@ static void spdk_app_main(void *arg1)
     }
     struct spdk_bs_opts opts;
     spdk_bs_opts_init(&opts, sizeof(opts));
-    spdk_bs_init(bs_dev, &opts, bs_init_cb, NULL);
+
+    if (args->try_load)
+    {
+        // SPDK_NOTICELOG("Mode: LOAD. Attempting to load existing blobstore from %s...\n", args->bdev_name);
+        spdk_bs_load(bs_dev, &opts, bs_start_cb, NULL);
+    }
+    else
+    {
+        // SPDK_NOTICELOG("Mode: INIT. Formatting and creating new blobstore on %s...\n", args->bdev_name);
+        spdk_bs_init(bs_dev, &opts, bs_start_cb, NULL);
+    }
 }
+
 static void *spdk_thread_func(void *arg)
 {
     spdk_thread_args_t *args = (spdk_thread_args_t *)arg;
@@ -556,6 +567,7 @@ static void _finish_async_op(PyObject *future, result_type_t rtype, uint64_t rva
 cleanup:
     PyGILState_Release(gstate);
 }
+
 static uint32_t count_set_bits(unsigned long long n)
 {
     uint32_t count = 0;
@@ -568,12 +580,20 @@ static uint32_t count_set_bits(unsigned long long n)
 }
 
 // --- 公开 API 实现 ---
+spdk_blob_id c_api_get_blob_id(spdk_blob_handle handle)
+{
+    struct spdk_blob *blob = (struct spdk_blob *)handle;
+    if (!blob)
+        return C_API_INVALID_BLOB_ID;
+    return spdk_blob_get_id(blob);
+}
+
 uint32_t c_api_get_worker_count(void)
 {
     return g_num_worker_threads;
 }
 
-int c_api_init(const char *bdev_name, const char *json_config_file, const char *reactor_mask, const char *sock, PyObject *completion_loop, uint32_t main_core)
+int c_api_start_spdk(const char *bdev_name, const char *json_config_file, const char *reactor_mask, const char *sock, PyObject *completion_loop, uint32_t main_core, bool try_load)
 {
     if (g_spdk_thread_id != 0)
         return -1;
@@ -615,6 +635,7 @@ int c_api_init(const char *bdev_name, const char *json_config_file, const char *
     args->reactor_mask = strdup(reactor_mask);
     args->sock = strdup(sock);
     args->main_core = main_core;
+    args->try_load = try_load;
 
     if (!args->bdev_name || !args->json_config_file || !args->reactor_mask || !args->sock)
     {
@@ -696,7 +717,6 @@ void c_api_free_io_request_ctx(int worker_id, io_request_context_t *ctx)
 }
 int c_api_submit_batch_io_async(int worker_id, io_request_context_t **contexts, uint32_t count, PyObject *future)
 {
-    DEBUG_LOG("Submitting batch of %u IO requests to worker %d", count, worker_id);
     if (!g_spdk_ready || count == 0)
         return -1;
     if (worker_id < 0 || (uint32_t)worker_id >= g_num_worker_threads)
